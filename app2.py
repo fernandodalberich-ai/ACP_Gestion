@@ -1,10 +1,11 @@
 # app.py — ACP Gestión (Flask 3+) — dotenv + Libro único + comprobante texto en Movimientos
+from __future__ import annotations
 
 from datetime import datetime, date
 from calendar import monthrange
 from functools import wraps
 from io import StringIO
-import os, csv
+import os, csv, json, re
 
 from dotenv import load_dotenv
 load_dotenv()  # carga variables de .env si existe
@@ -16,7 +17,7 @@ from flask import (
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from sqlalchemy import text
+from sqlalchemy import text, func, or_
 
 # --------------------
 # Configuración
@@ -32,9 +33,9 @@ app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB
 ALLOWED_EXTS = {'pdf', 'jpg', 'jpeg', 'png'}
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Categorías fijas
-INGRESO_CATS = ['Cuotas socios','Escuela','Eventos','Donaciones','Venta de comidas','Merchandising','Otros']
-SALIDA_CATS  = ['Alquileres','Préstamos','Servicios','Viáticos','Utilería','Compra mercadería','Costo mercadería vendida','Otros']
+# Categorías semilla (si no hay en DB)
+INGRESO_CATS_SEED = ['Cuotas socios','Escuela','Eventos','Donaciones','Venta de comidas','Merchandising','Otros']
+SALIDA_CATS_SEED  = ['Alquileres','Préstamos','Servicios','Viáticos','Utilería','Compra mercadería','Costo mercadería vendida','Otros']
 
 # Email (SMTP) - opcional
 SMTP_ENABLED = os.getenv('SMTP_ENABLED', 'true').lower() == 'true'
@@ -79,10 +80,25 @@ class Socio(db.Model):
     fecha_alta = db.Column(db.Date, default=date.today)
     cuota_mensual = db.Column(db.Float, default=0.0)
 
+# NUEVO: Subcomisión
+class Subcomision(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    nombre = db.Column(db.String(80), unique=True, nullable=False)
+    activo = db.Column(db.Boolean, default=True)
+
+# NUEVO: Categoría por tipo y subcomisión (opcional)
+class Categoria(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    nombre = db.Column(db.String(120), nullable=False)
+    tipo = db.Column(db.String(10), nullable=False)  # 'ingreso' | 'salida'
+    subcomision_id = db.Column(db.Integer, db.ForeignKey('subcomision.id'))  # NULL => global
+    activo = db.Column(db.Boolean, default=True)
+    __table_args__ = (db.UniqueConstraint('nombre','tipo','subcomision_id', name='uq_cat_tipo_sub'),)
+
 class Movimiento(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tipo = db.Column(db.String(10), nullable=False)              # 'ingreso' | 'salida'
-    categoria = db.Column(db.String(60))
+    categoria = db.Column(db.String(60))                         # legacy display
     origen = db.Column(db.String(20), default='manual')          # 'manual' | 'cuota' | 'merch' | 'evento' | 'escuela'
     socio_id = db.Column(db.Integer, db.ForeignKey('socio.id'))  # opcional (trazabilidad)
     cuota_id = db.Column(db.Integer, db.ForeignKey('cuota.id'))  # opcional (trazabilidad)
@@ -93,6 +109,9 @@ class Movimiento(db.Model):
     # comprobante como texto (solo Movimientos)
     comp_tipo = db.Column(db.String(30))   # Recibo, Factura, Ticket, etc.
     comp_nro  = db.Column(db.String(40))   # A-0001-00001234
+    # NUEVO
+    subcomision_id = db.Column(db.Integer, db.ForeignKey('subcomision.id'))  # dimensión
+    categoria_id = db.Column(db.Integer, db.ForeignKey('categoria.id'))      # opcional
     comprobantes = db.relationship('Comprobante', backref='mov', lazy=True)  # (no usado en /movimientos)
 
 class Evento(db.Model):
@@ -101,6 +120,20 @@ class Evento(db.Model):
     fecha = db.Column(db.Date, nullable=False)
     lugar = db.Column(db.String(120))
     descripcion = db.Column(db.String(255))
+    # NUEVO
+    subcomision_id = db.Column(db.Integer, db.ForeignKey('subcomision.id'))
+    presupuesto_ing = db.Column(db.Float, default=0.0)
+    presupuesto_egr = db.Column(db.Float, default=0.0)
+    notas = db.Column(db.String(255))
+
+# NUEVO: Costos/Ingresos por evento (granularidad por rubro)
+class EventoCosto(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    evento_id = db.Column(db.Integer, db.ForeignKey('evento.id'), nullable=False)
+    rubro = db.Column(db.String(120), nullable=False)
+    tipo = db.Column(db.String(10), nullable=False)  # 'ingreso' | 'salida'
+    monto = db.Column(db.Float, nullable=False, default=0.0)
+    notas = db.Column(db.String(255))
 
 class Inscripcion(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -128,53 +161,87 @@ class Comprobante(db.Model):
     mov_id = db.Column(db.Integer, db.ForeignKey('movimiento.id'))
     cuota_id = db.Column(db.Integer, db.ForeignKey('cuota.id'))
 
+# NUEVO: Plantillas de comunicaciones
+class PlantillaCom(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    msj_tipo = db.Column(db.String(10), nullable=False)  # 'email' | 'whatsapp'
+    asunto = db.Column(db.String(160))
+    cuerpo_html = db.Column(db.Text, nullable=False)     # usamos HTML también para WA (se limpiará)
+    variables_json = db.Column(db.Text, default='[]')    # ayuda para UI (lista de variables disponibles)
+
 # --------------------
 # Inicialización + mini-migraciones
 # --------------------
-def init_db():
+def _sqlite_cols(table_name: str) -> set[str]:
+    rows = db.session.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
+    return {r[1] for r in rows}
+
+def init_db_and_migrate():
     with app.app_context():
+        # Crear tablas nuevas
         db.create_all()
+
+        # Usuarios seed
         if not User.query.filter_by(username='admin').first():
             u = User(username='admin', role='admin')
             u.set_password('admin123')
             db.session.add(u)
             db.session.commit()
 
-def migrate_sqlite():
-    """Agrega socio.cuota_mensual si falta y asegura tablas."""
-    with app.app_context():
-        cols = [r[1] for r in db.session.execute(text("PRAGMA table_info(socio)")).fetchall()]
-        if 'cuota_mensual' not in cols:
+        # Migraciones suaves (SQLite)
+        # Socio: cuota_mensual
+        if 'cuota_mensual' not in _sqlite_cols('socio'):
             db.session.execute(text("ALTER TABLE socio ADD COLUMN cuota_mensual FLOAT DEFAULT 0.0"))
-        db.create_all()
-        db.session.commit()
 
-def migrate_movimientos_unificado():
-    """Agrega columnas de trazabilidad en movimiento si faltan."""
-    with app.app_context():
-        cols = [r[1] for r in db.session.execute(text("PRAGMA table_info(movimiento)")).fetchall()]
-        stmts = []
-        if 'origen'      not in cols: stmts.append("ALTER TABLE movimiento ADD COLUMN origen VARCHAR(20) DEFAULT 'manual'")
-        if 'socio_id'    not in cols: stmts.append("ALTER TABLE movimiento ADD COLUMN socio_id INTEGER")
-        if 'cuota_id'    not in cols: stmts.append("ALTER TABLE movimiento ADD COLUMN cuota_id INTEGER")
-        if 'stockmov_id' not in cols: stmts.append("ALTER TABLE movimiento ADD COLUMN stockmov_id INTEGER")
-        for s in stmts: db.session.execute(text(s))
-        db.session.commit()
-
-def migrate_comprobantes_texto_mov():
-    """Agrega comp_tipo y comp_nro en movimiento si faltan (solo para Ingresos/Salidas)."""
-    with app.app_context():
-        cols = [r[1] for r in db.session.execute(text("PRAGMA table_info(movimiento)")).fetchall()]
-        if 'comp_tipo' not in cols:
+        # Movimiento: columnas nuevas
+        mov_cols = _sqlite_cols('movimiento')
+        if 'origen' not in mov_cols:
+            db.session.execute(text("ALTER TABLE movimiento ADD COLUMN origen VARCHAR(20) DEFAULT 'manual'"))
+        if 'socio_id' not in mov_cols:
+            db.session.execute(text("ALTER TABLE movimiento ADD COLUMN socio_id INTEGER"))
+        if 'cuota_id' not in mov_cols:
+            db.session.execute(text("ALTER TABLE movimiento ADD COLUMN cuota_id INTEGER"))
+        if 'stockmov_id' not in mov_cols:
+            db.session.execute(text("ALTER TABLE movimiento ADD COLUMN stockmov_id INTEGER"))
+        if 'comp_tipo' not in mov_cols:
             db.session.execute(text("ALTER TABLE movimiento ADD COLUMN comp_tipo VARCHAR(30)"))
-        if 'comp_nro' not in cols:
+        if 'comp_nro' not in mov_cols:
             db.session.execute(text("ALTER TABLE movimiento ADD COLUMN comp_nro VARCHAR(40)"))
+        if 'subcomision_id' not in mov_cols:
+            db.session.execute(text("ALTER TABLE movimiento ADD COLUMN subcomision_id INTEGER"))
+        if 'categoria_id' not in mov_cols:
+            db.session.execute(text("ALTER TABLE movimiento ADD COLUMN categoria_id INTEGER"))
+
+        # Evento: nuevas columnas
+        ev_cols = _sqlite_cols('evento')
+        if 'subcomision_id' not in ev_cols:
+            db.session.execute(text("ALTER TABLE evento ADD COLUMN subcomision_id INTEGER"))
+        if 'presupuesto_ing' not in ev_cols:
+            db.session.execute(text("ALTER TABLE evento ADD COLUMN presupuesto_ing FLOAT DEFAULT 0.0"))
+        if 'presupuesto_egr' not in ev_cols:
+            db.session.execute(text("ALTER TABLE evento ADD COLUMN presupuesto_egr FLOAT DEFAULT 0.0"))
+        if 'notas' not in ev_cols:
+            db.session.execute(text("ALTER TABLE evento ADD COLUMN notas VARCHAR(255)"))
+
         db.session.commit()
 
-init_db()
-migrate_sqlite()
-migrate_movimientos_unificado()
-migrate_comprobantes_texto_mov()
+        # Seed Subcomisiones base
+        base_subs = ['Directiva','Shabibat','Escuela','Cultura','Bienestar']
+        existentes = {s.nombre for s in Subcomision.query.all()}
+        for n in base_subs:
+            if n not in existentes:
+                db.session.add(Subcomision(nombre=n, activo=True))
+        db.session.commit()
+
+        # Seed Categorías globales si no hay
+        if Categoria.query.count() == 0:
+            for n in INGRESO_CATS_SEED:
+                db.session.add(Categoria(nombre=n, tipo='ingreso', subcomision_id=None, activo=True))
+            for n in SALIDA_CATS_SEED:
+                db.session.add(Categoria(nombre=n, tipo='salida', subcomision_id=None, activo=True))
+            db.session.commit()
+
+init_db_and_migrate()
 
 # --------------------
 # Helpers
@@ -198,12 +265,14 @@ def role_required(*roles):
         return w
     return deco
 
-def send_email(to, subject, body):
+def send_email(to, subject, body_html_or_text):
     if not (SMTP_ENABLED and SMTP_USER and SMTP_PASS):
         return False, 'SMTP no configurado'
     import smtplib
     from email.mime.text import MIMEText
-    msg = MIMEText(body, 'plain', 'utf-8')
+    # si incluye tags HTML, lo mandamos como HTML
+    subtype = 'html' if '<' in body_html_or_text and '>' in body_html_or_text else 'plain'
+    msg = MIMEText(body_html_or_text, subtype, 'utf-8')
     msg['Subject'] = subject
     msg['From'] = SMTP_FROM
     msg['To'] = to
@@ -222,10 +291,22 @@ def send_whatsapp(to_e164, body):
     try:
         from twilio.rest import Client
         cli = Client(TWILIO_SID, TWILIO_TOKEN)
-        cli.messages.create(from_=TWILIO_WA_FROM, to=f'whatsapp:{to_e164}', body=body)
+        # WhatsApp ignora HTML: limpiamos tags simples
+        txt = body.replace('<br>', '\n').replace('<br/>','\n').replace('<p>','').replace('</p>','\n')
+        cli.messages.create(from_=TWILIO_WA_FROM, to=f'whatsapp:{to_e164}', body=txt)
         return True, 'OK'
     except Exception as e:
         return False, str(e)
+
+
+
+def render_vars(s: str, ctx: dict) -> str:
+    """Reemplaza {{ var }} por valores en ctx (tolera espacios)."""
+    if not s:
+        return ""
+    def _repl(m): 
+        return str(ctx.get(m.group(1).strip(), ""))
+    return re.sub(r"{{\s*([^}]+?)\s*}}", _repl, s)
 
 # --------------------
 # Layout (logo grande + oliva)
@@ -247,6 +328,7 @@ LAYOUT = """
       a { text-decoration: none; }
       .brand-logo { max-height: 64px; }
       @media (max-width: 576px){ .brand-logo{ max-height: 48px; } }
+      .table thead th { white-space: nowrap; }
     </style>
   </head>
   <body class="bg-light">
@@ -266,6 +348,9 @@ LAYOUT = """
               <li class="nav-item"><a class="nav-link" href="{{ url_for('cuotas') }}">Cuotas</a></li>
               <li class="nav-item"><a class="nav-link" href="{{ url_for('morosidad') }}">Morosidad</a></li>
               {% if session.get('role') == 'admin' %}
+                <li class="nav-item"><a class="nav-link" href="{{ url_for('subcomisiones') }}">Subcomisiones</a></li>
+                <li class="nav-item"><a class="nav-link" href="{{ url_for('categorias') }}">Categorías</a></li>
+                <li class="nav-item"><a class="nav-link" href="{{ url_for('plantillas') }}">Comunicaciones</a></li>
                 <li class="nav-item"><a class="nav-link" href="{{ url_for('usuarios') }}">Usuarios</a></li>
               {% endif %}
             {% endif %}
@@ -335,8 +420,8 @@ def logout():
 def dashboard():
     total_socios = Socio.query.count()
     activos = Socio.query.filter_by(activo=True).count()
-    ingresos = db.session.query(db.func.sum(db.case((Movimiento.tipo=='ingreso', Movimiento.monto), else_=0.0))).scalar() or 0.0
-    salidas  = db.session.query(db.func.sum(db.case((Movimiento.tipo=='salida',  Movimiento.monto), else_=0.0))).scalar() or 0.0
+    ingresos = db.session.query(func.coalesce(func.sum(db.case((Movimiento.tipo=='ingreso', Movimiento.monto), else_=0.0)),0.0)).scalar() or 0.0
+    salidas  = db.session.query(func.coalesce(func.sum(db.case((Movimiento.tipo=='salida',  Movimiento.monto), else_=0.0)),0.0)).scalar() or 0.0
     saldo = ingresos - salidas
     prox = Evento.query.order_by(Evento.fecha.asc()).limit(5).all()
     impagas = Cuota.query.filter_by(pagada=False).count()
@@ -374,10 +459,15 @@ def usuarios():
     body = render("""
     <h3 class="text-oliva">Usuarios</h3>
     <a class="btn btn-sm btn-oliva mb-3" href="{{ url_for('nuevo_usuario') }}">Nuevo</a>
-    <table class="table table-striped"><thead><tr><th>Usuario</th><th>Rol</th><th></th></tr></thead><tbody>
+    <table class="table table-striped"><thead><tr><th>Usuario</th><th>Rol</th><th class="text-end"></th></tr></thead><tbody>
     {% for u in us %}
-      <tr><td>{{ u.username }}</td><td>{{ u.role }}</td>
-        <td class="text-end"><a class="btn btn-sm btn-outline-dark" href="{{ url_for('editar_usuario', uid=u.id) }}">Editar</a></td></tr>
+      <tr>
+        <td>{{ u.username }}</td><td>{{ u.role }}</td>
+        <td class="text-end">
+          <a class="btn btn-sm btn-outline-dark" href="{{ url_for('editar_usuario', uid=u.id) }}">Editar</a>
+          <a class="btn btn-sm btn-outline-danger" href="{{ url_for('eliminar_usuario', uid=u.id) }}" onclick="return confirm('¿Eliminar usuario?')">Eliminar</a>
+        </td>
+      </tr>
     {% endfor %}</tbody></table>
     """, us=us)
     return page(body, title='Usuarios')
@@ -390,6 +480,8 @@ def nuevo_usuario():
         username = request.form['username'].strip()
         role = request.form['role']
         pwd = request.form['password']
+        if len(pwd) < 10:
+            flash('La contraseña debe tener al menos 10 caracteres'); return redirect(url_for('nuevo_usuario'))
         if User.query.filter_by(username=username).first():
             flash('El usuario ya existe'); return redirect(url_for('nuevo_usuario'))
         u = User(username=username, role=role); u.set_password(pwd)
@@ -402,7 +494,7 @@ def nuevo_usuario():
       <div class="col-md-3"><select class="form-select" name="role">
         <option value="admin">admin</option><option value="operador" selected>operador</option><option value="consulta">consulta</option>
       </select></div>
-      <div class="col-md-4"><input type="password" class="form-control" name="password" placeholder="Contraseña" required></div>
+      <div class="col-md-4"><input type="password" class="form-control" name="password" placeholder="Contraseña (min 10)" required></div>
     </div><div class="card-footer text-end"><button class="btn btn-oliva">Guardar</button></div></form>
     """
     return page(body, title='Nuevo usuario')
@@ -415,7 +507,10 @@ def editar_usuario(uid):
     if request.method == 'POST':
         u.role = request.form['role']
         newpwd = (request.form.get('password') or '').strip()
-        if newpwd: u.set_password(newpwd)
+        if newpwd:
+            if len(newpwd) < 10:
+                flash('La contraseña debe tener al menos 10 caracteres'); return redirect(url_for('editar_usuario', uid=uid))
+            u.set_password(newpwd)
         db.session.commit(); flash('Usuario actualizado')
         return redirect(url_for('usuarios'))
     body = render("""
@@ -427,10 +522,225 @@ def editar_usuario(uid):
         <option value="operador" {{ 'selected' if u.role=='operador' else '' }}>operador</option>
         <option value="consulta" {{ 'selected' if u.role=='consulta' else '' }}>consulta</option>
       </select></div>
-      <div class="col-md-4"><input type="password" class="form-control" name="password" placeholder="Nueva contraseña (opcional)"></div>
-    </div><div class="card-footer text-end"><button class="btn btn-oliva">Guardar</button></div></form>
+      <div class="col-md-4"><input type="password" class="form-control" name="password" placeholder="Nueva contraseña (opcional, min 10)"></div>
+    </div><div class="card-footer d-flex gap-2">
+      <a class="btn btn-secondary" href="{{ url_for('usuarios') }}">Volver</a>
+      <button class="btn btn-oliva">Guardar</button></div></form>
     """, u=u)
     return page(body, title='Editar usuario')
+
+@app.get('/usuarios/<int:uid>/eliminar')
+@login_required
+@role_required('admin')
+def eliminar_usuario(uid):
+    if uid == session.get('uid'):
+        flash('No podés borrarte a vos mismo.'); return redirect(url_for('usuarios'))
+    u = User.query.get_or_404(uid)
+    # impedir eliminar último admin
+    if u.role == 'admin':
+        otros_admins = User.query.filter(User.role=='admin', User.id!=u.id).count()
+        if otros_admins == 0:
+            flash('No se puede eliminar el último admin.'); return redirect(url_for('usuarios'))
+    db.session.delete(u); db.session.commit()
+    flash('Usuario eliminado'); return redirect(url_for('usuarios'))
+
+# --------------------
+# Subcomisiones (admin)
+# --------------------
+@app.route('/subcomisiones', methods=['GET','POST'])
+@login_required
+@role_required('admin')
+def subcomisiones():
+    if request.method == 'POST':
+        nombre = (request.form.get('nombre') or '').strip()
+        if not nombre:
+            flash('Nombre requerido'); return redirect(url_for('subcomisiones'))
+        if Subcomision.query.filter(func.lower(Subcomision.nombre)==nombre.lower()).first():
+            flash('Ya existe'); return redirect(url_for('subcomisiones'))
+        db.session.add(Subcomision(nombre=nombre, activo=True)); db.session.commit()
+        flash('Subcomisión creada'); return redirect(url_for('subcomisiones'))
+    subs = Subcomision.query.order_by(Subcomision.activo.desc(), Subcomision.nombre.asc()).all()
+    body = render("""
+    <h3 class="text-oliva">Subcomisiones</h3>
+    <form method="post" class="card mb-3">
+      <div class="card-body d-flex gap-2">
+        <input class="form-control" name="nombre" placeholder="Nueva subcomisión">
+        <button class="btn btn-oliva">Agregar</button>
+      </div>
+    </form>
+    <table class="table table-striped"><thead><tr><th>Nombre</th><th>Activa</th><th class="text-end"></th></tr></thead><tbody>
+    {% for s in subs %}
+      <tr>
+        <td>{{ s.nombre }}</td>
+        <td>{{ 'Sí' if s.activo else 'No' }}</td>
+        <td class="text-end">
+          {% if s.activo %}
+            <a class="btn btn-sm btn-outline-danger" href="{{ url_for('toggle_sub', sid=s.id) }}">Desactivar</a>
+          {% else %}
+            <a class="btn btn-sm btn-oliva" href="{{ url_for('toggle_sub', sid=s.id) }}">Activar</a>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}</tbody></table>
+    """, subs=subs)
+    return page(body, title='Subcomisiones')
+
+@app.get('/subcomisiones/<int:sid>/toggle')
+@login_required
+@role_required('admin')
+def toggle_sub(sid):
+    s = Subcomision.query.get_or_404(sid)
+    s.activo = not s.activo
+    db.session.commit()
+    return redirect(url_for('subcomisiones'))
+
+# --------------------
+# Categorías (admin) — por tipo y subcomisión
+# --------------------
+@app.route('/categorias', methods=['GET','POST'])
+@login_required
+@role_required('admin')
+def categorias():
+    subs = Subcomision.query.filter_by(activo=True).order_by(Subcomision.nombre).all()
+    subs_map = {s.id: s.nombre for s in Subcomision.query.all()}
+
+    if request.method == 'POST':
+        nombre = (request.form.get('nombre') or '').strip()
+        tipo = request.form.get('tipo')
+        sub_id = request.form.get('subcomision_id') or None
+        sub_id = int(sub_id) if sub_id else None
+        if tipo not in ('ingreso','salida') or not nombre:
+            flash('Datos inválidos'); return redirect(url_for('categorias'))
+        ex = Categoria.query.filter(
+            func.lower(Categoria.nombre)==nombre.lower(),
+            Categoria.tipo==tipo,
+            Categoria.subcomision_id.is_(None) if sub_id is None else Categoria.subcomision_id==sub_id
+        ).first()
+        if ex:
+            flash('Categoría duplicada para ese tipo/subcomisión'); return redirect(url_for('categorias'))
+        db.session.add(Categoria(nombre=nombre, tipo=tipo, subcomision_id=sub_id, activo=True))
+        db.session.commit(); flash('Categoría creada'); return redirect(url_for('categorias'))
+
+    cats = Categoria.query.order_by(Categoria.tipo.asc(),
+                                    Categoria.subcomision_id.asc().nullsfirst(),
+                                    Categoria.nombre.asc()).all()
+
+    body = render("""
+    <h3 class="text-oliva">Categorías</h3>
+    <form method="post" class="card mb-3"><div class="card-body row g-2">
+      <div class="col-md-4"><input class="form-control" name="nombre" placeholder="Nombre de categoría" required></div>
+      <div class="col-md-2">
+        <select class="form-select" name="tipo">
+          <option value="ingreso">Ingreso</option>
+          <option value="salida">Salida</option>
+        </select>
+      </div>
+      <div class="col-md-3">
+        <select class="form-select" name="subcomision_id">
+          <option value="">Global</option>
+          {% for s in subs %}<option value="{{ s.id }}">{{ s.nombre }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="col-md-3 text-end"><button class="btn btn-oliva">Agregar</button></div>
+    </div></form>
+
+    <div class="table-responsive"><table class="table table-striped align-middle">
+      <thead><tr><th>Tipo</th><th>Nombre</th><th>Subcomisión</th><th>Activa</th><th class="text-end">Acciones</th></tr></thead><tbody>
+      {% for c in cats %}
+        <tr>
+          <td>{{ c.tipo }}</td>
+          <td>{{ c.nombre }}</td>
+          <td>{{ subs_map.get(c.subcomision_id, 'Global') }}</td>
+          <td>{{ 'Sí' if c.activo else 'No' }}</td>
+          <td class="text-end">
+            <a class="btn btn-sm btn-outline-dark" href="{{ url_for('editar_categoria', cid=c.id) }}">Editar</a>
+            {% if c.activo %}
+              <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('toggle_categoria', cid=c.id) }}">Desactivar</a>
+            {% else %}
+              <a class="btn btn-sm btn-oliva" href="{{ url_for('toggle_categoria', cid=c.id) }}">Activar</a>
+            {% endif %}
+            <a class="btn btn-sm btn-outline-danger" href="{{ url_for('eliminar_categoria', cid=c.id) }}" onclick="return confirm('Si está en uso se desactivará. ¿Continuar?')">Eliminar</a>
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody></table></div>
+    """, subs=subs, cats=cats, subs_map=subs_map)
+    return page(body, title='Categorías')
+
+@app.route('/categorias/<int:cid>/editar', methods=['GET','POST'])
+@login_required
+@role_required('admin')
+def editar_categoria(cid):
+    c = Categoria.query.get_or_404(cid)
+    subs = Subcomision.query.order_by(Subcomision.nombre).all()
+    if request.method == 'POST':
+        nombre = (request.form.get('nombre') or '').strip()
+        tipo = request.form.get('tipo')
+        sub_id = request.form.get('subcomision_id') or None
+        sub_id = int(sub_id) if sub_id else None
+        if tipo not in ('ingreso','salida') or not nombre:
+            flash('Datos inválidos'); return redirect(url_for('editar_categoria', cid=cid))
+        dup = Categoria.query.filter(
+            func.lower(Categoria.nombre)==nombre.lower(),
+            Categoria.tipo==tipo,
+            Categoria.subcomision_id.is_(None) if sub_id is None else Categoria.subcomision_id==sub_id,
+            Categoria.id != cid
+        ).first()
+        if dup:
+            flash('Ya existe otra categoría con ese nombre/tipo/subcomisión')
+            return redirect(url_for('editar_categoria', cid=cid))
+        c.nombre = nombre; c.tipo = tipo; c.subcomision_id = sub_id
+        db.session.commit(); flash('Categoría actualizada'); return redirect(url_for('categorias'))
+
+    body = render("""
+    <h3 class="text-oliva">Editar categoría</h3>
+    <form method="post" class="card"><div class="card-body row g-2">
+      <div class="col-md-4"><input class="form-control" name="nombre" value="{{ c.nombre }}" required></div>
+      <div class="col-md-2">
+        <select class="form-select" name="tipo">
+          <option value="ingreso" {{ 'selected' if c.tipo=='ingreso' else '' }}>Ingreso</option>
+          <option value="salida"  {{ 'selected' if c.tipo=='salida' else '' }}>Salida</option>
+        </select>
+      </div>
+      <div class="col-md-3">
+        <select class="form-select" name="subcomision_id">
+          <option value="">Global</option>
+          {% for s in subs %}
+            <option value="{{ s.id }}" {{ 'selected' if c.subcomision_id==s.id else '' }}>{{ s.nombre }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-md-3 d-flex gap-2 justify-content-end">
+        <a class="btn btn-secondary" href="{{ url_for('categorias') }}">Volver</a>
+        <button class="btn btn-oliva">Guardar</button>
+      </div>
+    </div></form>
+    """, c=c, subs=subs)
+    return page(body, title='Editar categoría')
+
+@app.get('/categorias/<int:cid>/toggle')
+@login_required
+@role_required('admin')
+def toggle_categoria(cid):
+    c = Categoria.query.get_or_404(cid)
+    c.activo = not c.activo
+    db.session.commit()
+    return redirect(url_for('categorias'))
+
+@app.get('/categorias/<int:cid>/eliminar')
+@login_required
+@role_required('admin')
+def eliminar_categoria(cid):
+    c = Categoria.query.get_or_404(cid)
+    en_uso = Movimiento.query.filter(Movimiento.categoria_id==c.id).first()
+    if en_uso:
+        c.activo = False
+        db.session.commit()
+        flash('La categoría está en uso. Se desactivó en lugar de eliminarla.')
+    else:
+        db.session.delete(c); db.session.commit()
+        flash('Categoría eliminada')
+    return redirect(url_for('categorias'))
 
 # --------------------
 # Socios (ABM)
@@ -452,7 +762,8 @@ def socios():
     q = (request.args.get('q') or '').strip()
     qry = Socio.query
     if q:
-        like = f"%{q}%"; qry = qry.filter(db.or_(Socio.nombre.ilike(like), Socio.email.ilike(like), Socio.dni.ilike(like)))
+        like = f"%{q}%"
+        qry = qry.filter(or_(Socio.nombre.ilike(like), Socio.email.ilike(like), Socio.dni.ilike(like)))
     lista = qry.order_by(Socio.nombre.asc()).all()
 
     body = render("""
@@ -546,41 +857,81 @@ def export_socios():
                     headers={'Content-Disposition':'attachment; filename=socios.csv'})
 
 # --------------------
-# Movimientos (Libro único) + Filtros + Comprobante texto
+# Movimientos (Libro único) + Filtros + Comprobante texto + Subcomisión/Categoría
 # --------------------
 @app.route('/movimientos', methods=['GET','POST'])
 @login_required
 def movimientos():
+    # Datos para selects
+    subs = Subcomision.query.filter_by(activo=True).order_by(Subcomision.nombre).all()
+    subs_map = {s.id: s.nombre for s in subs}
+    cats_ing = Categoria.query.filter_by(tipo='ingreso', activo=True) \
+        .order_by(Categoria.subcomision_id.asc().nullsfirst(), Categoria.nombre.asc()).all()
+    cats_sal = Categoria.query.filter_by(tipo='salida', activo=True) \
+        .order_by(Categoria.subcomision_id.asc().nullsfirst(), Categoria.nombre.asc()).all()
+
+    # Alta
     if request.method == 'POST':
         tipo = request.form['tipo']  # ingreso | salida
         if tipo not in ('ingreso', 'salida'):
             flash('Tipo inválido'); return redirect(url_for('movimientos'))
-        categoria = (request.form.get('categoria') or '').strip() or None
+
+        categoria_id = request.form.get('categoria_id') or None
+        categoria_id = int(categoria_id) if categoria_id else None
+
+        cat_nombre = None
+        if categoria_id:
+            cat = Categoria.query.get(categoria_id)
+            if not cat or cat.tipo != tipo:
+                flash('Categoría inválida'); return redirect(url_for('movimientos'))
+            cat_nombre = cat.nombre
+        else:
+            # fallback libre (mantiene compatibilidad)
+            cat_nombre = (request.form.get('categoria_txt') or '').strip() or None
+
         monto = float(request.form['monto'])
         fecha_mov = datetime.strptime(request.form['fecha'], '%Y-%m-%d').date() if request.form.get('fecha') else date.today()
         descripcion = (request.form.get('descripcion') or '').strip() or None
         comp_tipo = (request.form.get('comp_tipo') or '').strip() or None
         comp_nro  = (request.form.get('comp_nro') or '').strip() or None
 
-        m = Movimiento(tipo=tipo, categoria=categoria, monto=monto, fecha=fecha_mov,
-                       descripcion=descripcion, comp_tipo=comp_tipo, comp_nro=comp_nro)
+        sub_id = request.form.get('subcomision_id') or None
+        sub_id = int(sub_id) if sub_id else None
+
+        m = Movimiento(
+            tipo=tipo,
+            categoria=cat_nombre,
+            categoria_id=categoria_id,
+            monto=monto,
+            fecha=fecha_mov,
+            descripcion=descripcion,
+            comp_tipo=comp_tipo,
+            comp_nro=comp_nro,
+            subcomision_id=sub_id
+        )
         db.session.add(m)
         db.session.commit()
         flash('Movimiento registrado')
         return redirect(url_for('movimientos'))
 
-    # Filtros
-    qry = Movimiento.query
+    # ------- Filtros (sin usar str() en Jinja) -------
     t = (request.args.get('tipo') or '').strip()
     o = (request.args.get('origen') or '').strip()
-    cat = (request.args.get('categoria') or '').strip()
+    cat_q = (request.args.get('categoria') or '').strip()
     d1 = (request.args.get('desde') or '').strip()
     d2 = (request.args.get('hasta') or '').strip()
+    sub_sel = request.args.get('subcomision_id', type=int) or 0  # << clave: casteo en Python
 
-    if t in ('ingreso','salida'): qry = qry.filter(Movimiento.tipo == t)
-    if o: qry = qry.filter(Movimiento.origen == o)
-    if cat:
-        like = f"%{cat}%"; qry = qry.filter(Movimiento.categoria.ilike(like))
+    qry = Movimiento.query
+    if t in ('ingreso','salida'):
+        qry = qry.filter(Movimiento.tipo == t)
+    if o:
+        qry = qry.filter(Movimiento.origen == o)
+    if cat_q:
+        like = f"%{cat_q}%"
+        qry = qry.filter(Movimiento.categoria.ilike(like))
+    if sub_sel:
+        qry = qry.filter(Movimiento.subcomision_id == sub_sel)
     if d1:
         from datetime import datetime as dt
         qry = qry.filter(Movimiento.fecha >= dt.strptime(d1, '%Y-%m-%d').date())
@@ -617,12 +968,21 @@ def movimientos():
           {% endfor %}
         </select>
       </div>
+      <div class="col-md-2">
+        <select name="subcomision_id" class="form-select">
+          <option value="">Todas las subcomisiones</option>
+          {% for s in subs %}
+            <option value="{{ s.id }}" {{ 'selected' if sub_sel == s.id else '' }}>{{ s.nombre }}</option>
+          {% endfor %}
+        </select>
+      </div>
       <div class="col-md-2"><input type="date" name="desde" class="form-control" value="{{ request.args.get('desde','') }}"></div>
       <div class="col-md-2"><input type="date" name="hasta" class="form-control" value="{{ request.args.get('hasta','') }}"></div>
-      <div class="col-md-2"><input class="form-control" name="categoria" value="{{ request.args.get('categoria','') }}" placeholder="Categoría"></div>
-      <div class="col-md-1"><button class="btn btn-oliva w-100">Filtrar</button></div>
+      <div class="col-md-1"><input class="form-control" name="categoria" value="{{ request.args.get('categoria','') }}" placeholder="Cat."></div>
+      <div class="col-md-0"><button class="btn btn-oliva">Filtrar</button></div>
     </form>
 
+    <!-- Alta -->
     <form method="post" class="card mb-4">
       <div class="card-header">Nuevo movimiento</div>
       <div class="card-body row g-2">
@@ -632,18 +992,38 @@ def movimientos():
             <option value="salida">Salida</option>
           </select>
         </div>
-        <div class="col-md-3">
-          <select class="form-select" name="categoria">
-            <optgroup label="Ingresos">
-              {% for c in INGRESO_CATS %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+
+        <div class="col-md-4">
+          <select class="form-select" name="categoria_id">
+            <option value="">(Elegir categoría)</option>
+            <optgroup label="Ingresos (global y por subcomisión)">
+              {% for c in cats_ing %}
+                <option value="{{ c.id }}">
+                  {{ c.nombre }}{% if c.subcomision_id %} — {{ subs_map.get(c.subcomision_id) }}{% endif %}
+                </option>
+              {% endfor %}
             </optgroup>
-            <optgroup label="Salidas">
-              {% for c in SALIDA_CATS %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+            <optgroup label="Salidas (global y por subcomisión)">
+              {% for c in cats_sal %}
+                <option value="{{ c.id }}">
+                  {{ c.nombre }}{% if c.subcomision_id %} — {{ subs_map.get(c.subcomision_id) }}{% endif %}
+                </option>
+              {% endfor %}
             </optgroup>
           </select>
+          <div class="form-text">O escribí una (libre, opcional):</div>
+          <input class="form-control" name="categoria_txt" placeholder="Categoría libre (opcional)">
         </div>
+
+        <div class="col-md-3">
+          <select class="form-select" name="subcomision_id">
+            <option value="">Sin subcomisión</option>
+            {% for s in subs %}<option value="{{ s.id }}">{{ s.nombre }}</option>{% endfor %}
+          </select>
+        </div>
+
         <div class="col-md-2"><input class="form-control" name="monto" type="number" step="0.01" min="0" placeholder="Monto" required></div>
-        <div class="col-md-2"><input class="form-control" name="fecha" type="date" value="{{ hoy }}"></div>
+        <div class="col-md-3"><input class="form-control" name="fecha" type="date" value="{{ hoy }}"></div>
         <div class="col-md-3"><input class="form-control" name="descripcion" placeholder="Descripción"></div>
         <div class="col-md-2"><input class="form-control" name="comp_tipo" placeholder="Tipo comp. (Recibo/Factura)"></div>
         <div class="col-md-2"><input class="form-control" name="comp_nro"  placeholder="N° comp."></div>
@@ -651,21 +1031,24 @@ def movimientos():
       <div class="card-footer text-end"><button class="btn btn-oliva">Guardar</button></div>
     </form>
 
+    <!-- Totales -->
     <div class="row g-3 mb-2">
       <div class="col-md-3"><div class="card"><div class="card-body"><small class="text-muted">Total ingresos (filtrados)</small><div class="fs-4">$ {{ '%.2f' % ingresos }}</div></div></div></div>
       <div class="col-md-3"><div class="card"><div class="card-body"><small class="text-muted">Total salidas (filtradas)</small><div class="fs-4">$ {{ '%.2f' % salidas }}</div></div></div></div>
       <div class="col-md-3"><div class="card"><div class="card-body"><small class="text-muted">Saldo</small><div class="fs-4">$ {{ '%.2f' % saldo }}</div></div></div></div>
     </div>
 
+    <!-- Listado -->
     <div class="table-responsive"><table class="table table-striped align-middle">
       <thead><tr>
-        <th>Fecha</th><th>Ingreso/Salida</th><th>Origen</th><th>Categoría</th>
+        <th>Fecha</th><th>Ingreso/Salida</th><th>Subcomisión</th><th>Origen</th><th>Categoría</th>
         <th>Descripción</th><th>Comprobante</th><th class="text-end">Monto</th><th></th>
       </tr></thead><tbody>
       {% for m in lista %}
         <tr>
           <td>{{ m.fecha.strftime('%d/%m/%Y') }}</td>
           <td>{{ m.tipo }}</td>
+          <td>{{ subs_map.get(m.subcomision_id, '—') }}</td>
           <td><span class="badge text-bg-light">{{ m.origen or 'manual' }}</span></td>
           <td>{{ m.categoria or '—' }}</td>
           <td>{{ m.descripcion or '—' }}</td>
@@ -675,11 +1058,16 @@ def movimientos():
             {% else %}—{% endif %}
           </td>
           <td class="text-end">$ {{ '%.2f' % m.monto }}</td>
-          <td class="text-end"><a class="btn btn-sm btn-outline-danger" href="{{ url_for('eliminar_movimiento', mov_id=m.id) }}" onclick="return confirm('¿Eliminar movimiento?')">Eliminar</a></td>
+          <td class="text-end">
+            <a class="btn btn-sm btn-outline-danger" href="{{ url_for('eliminar_movimiento', mov_id=m.id) }}" onclick="return confirm('¿Eliminar movimiento?')">Eliminar</a>
+          </td>
         </tr>
       {% endfor %}</tbody></table></div>
-    """, lista=lista, ingresos=ingresos, salidas=salidas, saldo=saldo, hoy=date.today().strftime('%Y-%m-%d'),
-       INGRESO_CATS=INGRESO_CATS, SALIDA_CATS=SALIDA_CATS)
+    """,
+    lista=lista, ingresos=ingresos, salidas=salidas, saldo=saldo,
+    hoy=date.today().strftime('%Y-%m-%d'),
+    subs=subs, subs_map=subs_map, cats_ing=cats_ing, cats_sal=cats_sal,
+    sub_sel=sub_sel)
     return page(body, title='Movimientos')
 
 @app.get('/movimientos/<int:mov_id>/eliminar')
@@ -698,20 +1086,29 @@ def eliminar_movimiento(mov_id):
 @login_required
 def export_movimientos():
     si = StringIO(); w = csv.writer(si)
-    w.writerow(['id','tipo','categoria','origen','socio_id','cuota_id','stockmov_id','monto','fecha','descripcion','comp_tipo','comp_nro'])
+    w.writerow(['id','tipo','categoria','origen','socio_id','cuota_id','stockmov_id','monto','fecha','descripcion','comp_tipo','comp_nro','subcomision_id','categoria_id'])
     for m in Movimiento.query.order_by(Movimiento.id.asc()).all():
         w.writerow([m.id, m.tipo, m.categoria or '', m.origen or 'manual',
                     m.socio_id or '', m.cuota_id or '', m.stockmov_id or '',
-                    m.monto, m.fecha, m.descripcion or '', m.comp_tipo or '', m.comp_nro or ''])
+                    m.monto, m.fecha, m.descripcion or '', m.comp_tipo or '', m.comp_nro or '',
+                    m.subcomision_id or '', m.categoria_id or ''])
     return Response(si.getvalue(), mimetype='text/csv',
                     headers={'Content-Disposition':'attachment; filename=movimientos.csv'})
 
 # --------------------
-# Eventos + Inscripciones
+# Eventos (+ Inscripciones) — sin hasattr en Jinja
 # --------------------
 @app.route('/eventos', methods=['GET','POST'])
 @login_required
 def eventos():
+    # Subcomisiones para el select (si existen)
+    try:
+        subs = Subcomision.query.order_by(Subcomision.nombre.asc()).all()
+        subs_map = {s.id: s.nombre for s in subs}
+    except Exception:
+        subs, subs_map = [], {}
+
+    # Alta de evento
     if request.method == 'POST':
         e = Evento(
             titulo=request.form['titulo'].strip(),
@@ -719,64 +1116,147 @@ def eventos():
             lugar=(request.form.get('lugar') or '').strip() or None,
             descripcion=(request.form.get('descripcion') or '').strip() or None
         )
-        db.session.add(e); db.session.commit(); flash('Evento creado'); return redirect(url_for('eventos'))
-    evs = Evento.query.order_by(Evento.fecha.desc()).all()
+        # Campos opcionales: sólo si existen en el modelo
+        try:
+            if hasattr(Evento, 'subcomision_id'):
+                v = request.form.get('subcomision_id') or None
+                e.subcomision_id = int(v) if v else None
+            if hasattr(Evento, 'presupuesto_ing'):
+                e.presupuesto_ing = float(request.form.get('presupuesto_ing') or 0) or None
+            if hasattr(Evento, 'presupuesto_egr'):
+                e.presupuesto_egr = float(request.form.get('presupuesto_egr') or 0) or None
+            if hasattr(Evento, 'notas'):
+                e.notas = (request.form.get('notas') or '').strip() or None
+        except Exception:
+            pass
+
+        db.session.add(e)
+        db.session.commit()
+        flash('Evento creado')
+        return redirect(url_for('eventos'))
+
+    # Armamos una lista de dicts para no usar hasattr en Jinja
+    evs_model = Evento.query.order_by(Evento.fecha.desc()).all()
+    evs = [{
+        'id': e.id,
+        'titulo': e.titulo,
+        'fecha': e.fecha,
+        'lugar': e.lugar,
+        'descripcion': e.descripcion,
+        'subcomision_id': getattr(e, 'subcomision_id', None),
+        'presupuesto_ing': getattr(e, 'presupuesto_ing', None),
+        'presupuesto_egr': getattr(e, 'presupuesto_egr', None),
+        'notas': getattr(e, 'notas', None),
+    } for e in evs_model]
+
     socios = Socio.query.order_by(Socio.nombre.asc()).all()
+
     body = render("""
     <div class="d-flex justify-content-between align-items-center mb-3">
       <h3 class="text-oliva">Eventos</h3>
     </div>
-    <form method="post" class="card mb-4"><div class="card-header">Nuevo evento</div>
+
+    <!-- Nuevo evento -->
+    <form method="post" class="card mb-4">
+      <div class="card-header">Nuevo evento</div>
       <div class="card-body row g-2">
         <div class="col-md-4"><input class="form-control" name="titulo" placeholder="Título" required></div>
         <div class="col-md-2"><input class="form-control" type="date" name="fecha" required></div>
         <div class="col-md-3"><input class="form-control" name="lugar" placeholder="Lugar (opcional)"></div>
         <div class="col-md-3"><input class="form-control" name="descripcion" placeholder="Descripción (opcional)"></div>
-      </div><div class="card-footer text-end"><button class="btn btn-oliva">Guardar</button></div></form>
+
+        <div class="col-md-3">
+          <select class="form-select" name="subcomision_id">
+            <option value="">Sin subcomisión</option>
+            {% for s in subs %}<option value="{{ s.id }}">{{ s.nombre }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="col-md-3"><input class="form-control" name="presupuesto_ing" type="number" step="0.01" min="0" placeholder="Presup. Ingresos"></div>
+        <div class="col-md-3"><input class="form-control" name="presupuesto_egr" type="number" step="0.01" min="0" placeholder="Presup. Egresos"></div>
+        <div class="col-md-3"><input class="form-control" name="notas" placeholder="Notas (opcional)"></div>
+      </div>
+      <div class="card-footer text-end"><button class="btn btn-oliva">Guardar</button></div>
+    </form>
 
     {% for e in evs %}
       <div class="card mb-3">
         <div class="card-header d-flex justify-content-between align-items-center">
-          <div><strong>{{ e.titulo }}</strong> — {{ e.fecha.strftime('%d/%m/%Y') }} @ {{ e.lugar or '—' }}</div>
+ 	 <div>
+  	  <strong>{{ e.titulo }}</strong> — {{ e.fecha.strftime('%d/%m/%Y') }} @ {{ e.lugar or '—' }}
+    	  {% if e.subcomision_id %}
+      	    <span class="ms-2 badge text-bg-light">{{ subs_map.get(e.subcomision_id) }}</span>
+          {% endif %}
+        </div>
+        <div class="btn-group">
+          <a class="btn btn-sm btn-outline-dark" href="{{ url_for('editar_evento', evento_id=e.id) }}">Editar</a>
           <a class="btn btn-sm btn-outline-danger" href="{{ url_for('eliminar_evento', evento_id=e.id) }}" onclick="return confirm('¿Eliminar evento?')">Eliminar</a>
         </div>
+      </div>
+
+
         <div class="card-body">
+          {% if e.presupuesto_ing is not none or e.presupuesto_egr is not none or e.notas %}
+            <div class="mb-2 small text-muted">
+              Presup.: Ing ${{ '%.2f' % (e.presupuesto_ing or 0) }} — Egr ${{ '%.2f' % (e.presupuesto_egr or 0) }}
+              {% if e.notas %} — {{ e.notas }}{% endif %}
+            </div>
+          {% endif %}
+
+          <!-- Inscripciones -->
+          <h6 class="text-oliva">Inscripciones</h6>
           <form method="post" action="{{ url_for('inscribir', evento_id=e.id) }}" class="row g-2 mb-3">
-            <div class="col-md-6">
+            <div class="col-md-9">
               <select class="form-select" name="socio_id" required>
                 <option value="">Inscribir socio…</option>
                 {% for s in socios %}<option value="{{ s.id }}">{{ s.nombre }}</option>{% endfor %}
               </select>
             </div>
-            <div class="col-md-2"><button class="btn btn-oliva">Inscribir</button></div>
+            <div class="col-md-3"><button class="btn btn-oliva w-100">Inscribir</button></div>
           </form>
+
           {% set insc = Inscripcion.query.filter_by(evento_id=e.id).all() %}
           {% if insc %}
-            <div class="table-responsive"><table class="table table-sm">
+            <div class="table-responsive"><table class="table table-sm align-middle">
               <thead><tr><th>Socio</th><th>Fecha</th><th></th></tr></thead><tbody>
               {% for i in insc %}{% set s = Socio.query.get(i.socio_id) %}
-                <tr><td>{{ s.nombre if s else ('#'+i.socio_id|string) }}</td>
+                <tr>
+                  <td>{{ s.nombre if s else ('#' ~ i.socio_id) }}</td>
                   <td>{{ i.fecha.strftime('%d/%m/%Y') }}</td>
-                  <td class="text-end"><a class="btn btn-sm btn-outline-danger" href="{{ url_for('eliminar_inscripcion', insc_id=i.id) }}" onclick="return confirm('¿Quitar inscripción?')">Quitar</a></td></tr>
-              {% endfor %}</tbody></table></div>
-          {% else %}<em>Sin inscriptos.</em>{% endif %}
+                  <td class="text-end">
+                    <a class="btn btn-sm btn-outline-danger" href="{{ url_for('eliminar_inscripcion', insc_id=i.id) }}" onclick="return confirm('¿Quitar inscripción?')">Quitar</a>
+                  </td>
+                </tr>
+              {% endfor %}
+              </tbody></table></div>
+          {% else %}
+            <em>Sin inscriptos.</em>
+          {% endif %}
         </div>
       </div>
     {% endfor %}
-    """, evs=evs, socios=socios, Inscripcion=Inscripcion, Socio=Socio)
+    """, evs=evs, socios=socios, subs=subs, subs_map=subs_map,
+       Inscripcion=Inscripcion, Socio=Socio)
     return page(body, title='Eventos')
 
 @app.post('/eventos/<int:evento_id>/inscribir')
 @login_required
 def inscribir(evento_id):
-    _ = Evento.query.get_or_404(evento_id)
+    Evento.query.get_or_404(evento_id)  # valida
     socio_id = int(request.form['socio_id'])
     if not Socio.query.get(socio_id):
         flash('Socio inexistente'); return redirect(url_for('eventos'))
     if Inscripcion.query.filter_by(evento_id=evento_id, socio_id=socio_id).first():
         flash('El socio ya está inscripto'); return redirect(url_for('eventos'))
-    db.session.add(Inscripcion(evento_id=evento_id, socio_id=socio_id)); db.session.commit()
+    db.session.add(Inscripcion(evento_id=evento_id, socio_id=socio_id))
+    db.session.commit()
     flash('Inscripción registrada'); return redirect(url_for('eventos'))
+
+@app.get('/inscripciones/<int:insc_id>/eliminar')
+@login_required
+def eliminar_inscripcion(insc_id):
+    i = Inscripcion.query.get_or_404(insc_id)
+    db.session.delete(i); db.session.commit()
+    flash('Inscripción eliminada'); return redirect(url_for('eventos'))
 
 @app.get('/eventos/<int:evento_id>/eliminar')
 @login_required
@@ -786,12 +1266,187 @@ def eliminar_evento(evento_id):
     db.session.delete(e); db.session.commit()
     flash('Evento eliminado'); return redirect(url_for('eventos'))
 
-@app.get('/inscripciones/<int:insc_id>/eliminar')
+@app.route('/eventos/<int:evento_id>/editar', methods=['GET','POST'])
 @login_required
-def eliminar_inscripcion(insc_id):
-    i = Inscripcion.query.get_or_404(insc_id)
-    db.session.delete(i); db.session.commit()
-    flash('Inscripción eliminada'); return redirect(url_for('eventos'))
+def editar_evento(evento_id):
+    e = Evento.query.get_or_404(evento_id)
+
+    # Subcomisiones para el select (si existen)
+    try:
+        subs = Subcomision.query.order_by(Subcomision.nombre.asc()).all()
+    except Exception:
+        subs = []
+
+    if request.method == 'POST':
+        # Campos básicos
+        e.titulo = request.form['titulo'].strip()
+        e.fecha = datetime.strptime(request.form['fecha'], '%Y-%m-%d').date()
+        e.lugar = (request.form.get('lugar') or '').strip() or None
+        e.descripcion = (request.form.get('descripcion') or '').strip() or None
+
+        # Opcionales: sólo seteo si la columna existe en el modelo
+        try:
+            if hasattr(Evento, 'subcomision_id'):
+                v = request.form.get('subcomision_id') or None
+                e.subcomision_id = int(v) if v else None
+            if hasattr(Evento, 'presupuesto_ing'):
+                e.presupuesto_ing = float(request.form.get('presupuesto_ing') or 0) or None
+            if hasattr(Evento, 'presupuesto_egr'):
+                e.presupuesto_egr = float(request.form.get('presupuesto_egr') or 0) or None
+            if hasattr(Evento, 'notas'):
+                e.notas = (request.form.get('notas') or '').strip() or None
+        except Exception:
+            pass
+
+        db.session.commit()
+        flash('Evento actualizado')
+        return redirect(url_for('eventos'))
+
+    # Paso valores ya “listos” para el template (sin usar hasattr en Jinja)
+    ev = {
+        'id': e.id,
+        'titulo': e.titulo or '',
+        'fecha_iso': e.fecha.strftime('%Y-%m-%d') if e.fecha else '',
+        'lugar': e.lugar or '',
+        'descripcion': e.descripcion or '',
+        'subcomision_id': getattr(e, 'subcomision_id', None),
+        'presupuesto_ing': getattr(e, 'presupuesto_ing', None),
+        'presupuesto_egr': getattr(e, 'presupuesto_egr', None),
+        'notas': getattr(e, 'notas', '') or '',
+    }
+
+    body = render("""
+    <h3 class="text-oliva">Editar evento</h3>
+    <form method="post" class="card">
+      <div class="card-body row g-2">
+        <div class="col-md-4"><input class="form-control" name="titulo" value="{{ ev.titulo }}" required></div>
+        <div class="col-md-2"><input class="form-control" type="date" name="fecha" value="{{ ev.fecha_iso }}" required></div>
+        <div class="col-md-3"><input class="form-control" name="lugar" value="{{ ev.lugar }}" placeholder="Lugar"></div>
+        <div class="col-md-3"><input class="form-control" name="descripcion" value="{{ ev.descripcion }}" placeholder="Descripción"></div>
+
+        <div class="col-md-3">
+          <select class="form-select" name="subcomision_id">
+            <option value="" {{ 'selected' if not ev.subcomision_id else '' }}>Sin subcomisión</option>
+            {% for s in subs %}
+              <option value="{{ s.id }}" {{ 'selected' if ev.subcomision_id==s.id else '' }}>{{ s.nombre }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-md-3">
+          <input class="form-control" name="presupuesto_ing" type="number" step="0.01" min="0"
+                 value="{{ ev.presupuesto_ing if ev.presupuesto_ing is not none else '' }}"
+                 placeholder="Presup. Ingresos">
+        </div>
+        <div class="col-md-3">
+          <input class="form-control" name="presupuesto_egr" type="number" step="0.01" min="0"
+                 value="{{ ev.presupuesto_egr if ev.presupuesto_egr is not none else '' }}"
+                 placeholder="Presup. Egresos">
+        </div>
+        <div class="col-md-3"><input class="form-control" name="notas" value="{{ ev.notas }}" placeholder="Notas"></div>
+      </div>
+      <div class="card-footer d-flex gap-2 justify-content-end">
+        <a class="btn btn-secondary" href="{{ url_for('eventos') }}">Cancelar</a>
+        <button class="btn btn-oliva">Guardar cambios</button>
+      </div>
+    </form>
+    """, ev=ev, subs=subs)
+    return page(body, title='Editar evento')
+
+
+# --------------------
+# Comunicaciones: Plantillas + Envío a morosos / inscritos
+# --------------------
+@app.route('/comunicaciones/plantillas', methods=['GET','POST'])
+@login_required
+@role_required('admin')
+def plantillas():
+    if request.method == 'POST':
+        msj_tipo = request.form.get('msj_tipo')
+        if msj_tipo not in ('email','whatsapp'):
+            flash('Tipo inválido'); return redirect(url_for('plantillas'))
+        asunto = (request.form.get('asunto') or '').strip() or None
+        cuerpo = (request.form.get('cuerpo_html') or '').strip()
+        vars_list = request.form.get('vars') or '["nombre","evento","fecha","deuda_total"]'
+        try:
+            json.loads(vars_list)
+        except Exception:
+            vars_list = '["nombre","evento","fecha","deuda_total"]'
+        db.session.add(PlantillaCom(msj_tipo=msj_tipo, asunto=asunto, cuerpo_html=cuerpo, variables_json=vars_list))
+        db.session.commit(); flash('Plantilla creada'); return redirect(url_for('plantillas'))
+    pls = PlantillaCom.query.order_by(PlantillaCom.id.desc()).all()
+    body = render("""
+    <h3 class="text-oliva">Comunicaciones — Plantillas</h3>
+    <form method="post" class="card mb-3">
+      <div class="card-body row g-2">
+        <div class="col-md-2">
+          <select class="form-select" name="msj_tipo"><option value="email">Email</option><option value="whatsapp">WhatsApp</option></select>
+        </div>
+        <div class="col-md-4"><input class="form-control" name="asunto" placeholder="Asunto (email)"></div>
+        <div class="col-md-12"><textarea class="form-control" name="cuerpo_html" rows="5" placeholder="Cuerpo (HTML o texto) — variables: {{nombre}}, {{evento}}, {{fecha}}, {{deuda_total}}"></textarea></div>
+        <div class="col-md-6"><input class="form-control" name="vars" value='["nombre","evento","fecha","deuda_total"]'></div>
+      </div>
+      <div class="card-footer d-flex gap-2">
+        <button class="btn btn-oliva">Guardar plantilla</button>
+        <form method="post" action="{{ url_for('preview_email') }}" class="d-flex gap-2">
+            <input class="form-control" name="to" placeholder="Correo prueba">
+            <input class="form-control" name="asunto" placeholder="Asunto">
+            <input class="form-control" name="cuerpo" placeholder="Cuerpo HTML/Texto">
+            <button class="btn btn-outline-dark">Enviar prueba</button>
+        </form>
+      </div>
+    </form>
+
+    <div class="table-responsive"><table class="table table-striped">
+      <thead><tr><th>ID</th><th>Tipo</th><th>Asunto</th><th>Vars</th></tr></thead>
+      <tbody>
+        {% for p in pls %}
+          <tr><td>{{ p.id }}</td><td>{{ p.msj_tipo }}</td><td>{{ p.asunto or '—' }}</td><td><code>{{ p.variables_json }}</code></td></tr>
+        {% endfor %}
+      </tbody>
+    </table></div>
+    """, pls=pls)
+    return page(body, title='Comunicaciones')
+
+@app.post('/comunicaciones/preview')
+@login_required
+@role_required('admin')
+def preview_email():
+    to = (request.form.get('to') or '').strip()
+    asunto = (request.form.get('asunto') or '').strip() or '(prueba)'
+    cuerpo = (request.form.get('cuerpo') or '').strip() or 'Hola, esto es una prueba.'
+    ok, info = send_email(to, asunto, cuerpo)
+    flash('Prueba enviada' if ok else f'Error: {info}')
+    return redirect(url_for('plantillas'))
+
+@app.post('/comunicaciones/evento/<int:evento_id>/enviar')
+@login_required
+def com_evento_enviar(evento_id):
+    e = Evento.query.get_or_404(evento_id)
+    via = request.form.get('via')
+    if via not in ('email','whatsapp'):
+        flash('Destino inválido'); return redirect(url_for('eventos'))
+    pid = request.form.get('plantilla_id') or None
+    tpl = PlantillaCom.query.get(int(pid)) if pid else None
+
+    insc = Inscripcion.query.filter_by(evento_id=e.id).all()
+    enviados, errores = 0, 0
+    for i in insc:
+        s = Socio.query.get(i.socio_id)
+        if not s: continue
+        nombre = s.nombre
+        cuerpo = tpl.cuerpo_html if tpl else "Hola {{nombre}}, te contactamos por el evento {{evento}} del {{fecha}}."
+        cuerpo = render_vars(cuerpo, nombre=nombre, evento=e.titulo, fecha=e.fecha.strftime('%d/%m/%Y'))
+        if via == 'email' and s.email:
+            asunto = tpl.asunto or f"Información: {e.titulo}" if tpl else f"Evento: {e.titulo}"
+            ok, _ = send_email(s.email, asunto, cuerpo)
+        elif via == 'whatsapp' and s.telefono:
+            ok, _ = send_whatsapp(s.telefono, cuerpo)
+        else:
+            ok = False
+        enviados += 1 if ok else 0
+        errores += 0 if ok else 1
+    flash(f'Envíos a inscritos: {enviados} OK, {errores} errores')
+    return redirect(url_for('eventos'))
 
 # --------------------
 # Cuotas y Morosidad
@@ -991,26 +1646,25 @@ def enviar_recordatorios():
     hoy = date.today()
     vencidas = Cuota.query.filter(Cuota.pagada==False, Cuota.fecha_venc < hoy).all()
 
-    enviados, errores = 0, []
+    enviados, errores = 0, 0
     for c in vencidas:
         s = Socio.query.get(c.socio_id)
         if not s: continue
-        mensaje = (f"Hola {s.nombre},\n\n"
-                   f"Tenés cuotas pendientes en la Asociación.\n"
-                   f"- Período: {c.periodo}\n- Vencimiento: {c.fecha_venc.strftime('%d/%m/%Y')}\n"
-                   f"- Importe: ${c.monto:,.2f}\n\n"
-                   "Te pedimos regularizar a la brevedad. Gracias.\nACP Rosario")
-
+        mensaje = (f"Hola {s.nombre},<br>"
+                   f"Tenés cuotas pendientes en la Asociación.<br>"
+                   f"- Período: {c.periodo}<br>- Vencimiento: {c.fecha_venc.strftime('%d/%m/%Y')}<br>"
+                   f"- Importe: ${c.monto:,.2f}<br><br>"
+                   "Te pedimos regularizar a la brevedad. Gracias.<br>ACP Rosario")
         if via == 'email' and s.email:
-            ok, info = send_email(s.email, "Recordatorio de cuota pendiente", mensaje)
+            ok, _ = send_email(s.email, "Recordatorio de cuota pendiente", mensaje)
         elif via == 'whatsapp' and s.telefono:
-            ok, info = send_whatsapp(s.telefono, mensaje)  # E.164: +549341...
+            ok, _ = send_whatsapp(s.telefono, mensaje)
         else:
-            ok, info = False, 'Sin contacto'
+            ok = False
         enviados += 1 if ok else 0
-        if not ok: errores.append((s.nombre, info))
+        errores += 0 if ok else 1
 
-    flash(f'Recordatorios enviados: {enviados}. Errores: {len(errores)}')
+    flash(f'Recordatorios enviados: {enviados}. Errores: {errores}')
     return redirect(url_for('morosidad'))
 
 # --------------------
