@@ -1,4 +1,5 @@
 # app.py — ACP Gestión (Flask 3+) — dotenv + Libro único + comprobante texto en Movimientos
+from sqlalchemy.engine import make_url
 from __future__ import annotations
 
 from datetime import datetime, date
@@ -6,6 +7,7 @@ from calendar import monthrange
 from functools import wraps
 from io import StringIO
 import os, csv, json, re
+
 
 from dotenv import load_dotenv
 load_dotenv()  # carga variables de .env si existe
@@ -24,8 +26,10 @@ from sqlalchemy import text, func, or_
 # --------------------
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'changeme')
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('SQLALCHEMY_DATABASE_URI', 'sqlite:///asociacion.db')
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
+    'DATABASE_URL',
+    os.getenv('SQLALCHEMY_DATABASE_URI', 'sqlite:///asociacion.db')
+)
 
 # Archivos de cuotas (comprobantes adjuntos)
 app.config['UPLOAD_FOLDER'] = os.path.join('static', 'comprobantes')
@@ -172,74 +176,89 @@ class PlantillaCom(db.Model):
 # --------------------
 # Inicialización + mini-migraciones
 # --------------------
+
 def _sqlite_cols(table_name: str) -> set[str]:
-    rows = db.session.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
+    try:
+        if make_url(app.config['SQLALCHEMY_DATABASE_URI']).get_backend_name() != 'sqlite':
+            return set()
+    except Exception:
+        return set()
+    rows = db.session.execute(text(f'PRAGMA table_info("{table_name}")')).fetchall()
     return {r[1] for r in rows}
+
+is_sqlite = make_url(app.config.get('SQLALCHEMY_DATABASE_URI', 'sqlite:///')).get_backend_name() == 'sqlite'
+
 
 def init_db_and_migrate():
     with app.app_context():
-        # Crear tablas nuevas
+        # Crear tablas nuevas según los modelos
         db.create_all()
 
-        # Usuarios seed
+        # Seed usuario admin
         if not User.query.filter_by(username='admin').first():
             u = User(username='admin', role='admin')
             u.set_password('admin123')
             db.session.add(u)
             db.session.commit()
 
-        # Migraciones suaves (SQLite)
-        # Socio: cuota_mensual
-        if 'cuota_mensual' not in _sqlite_cols('socio'):
-            db.session.execute(text("ALTER TABLE socio ADD COLUMN cuota_mensual FLOAT DEFAULT 0.0"))
+        # Detectar motor
+        is_sqlite = app.config.get('SQLALCHEMY_DATABASE_URI', '').startswith('sqlite:')
 
-        # Movimiento: columnas nuevas
-        mov_cols = _sqlite_cols('movimiento')
-        if 'origen' not in mov_cols:
-            db.session.execute(text("ALTER TABLE movimiento ADD COLUMN origen VARCHAR(20) DEFAULT 'manual'"))
-        if 'socio_id' not in mov_cols:
-            db.session.execute(text("ALTER TABLE movimiento ADD COLUMN socio_id INTEGER"))
-        if 'cuota_id' not in mov_cols:
-            db.session.execute(text("ALTER TABLE movimiento ADD COLUMN cuota_id INTEGER"))
-        if 'stockmov_id' not in mov_cols:
-            db.session.execute(text("ALTER TABLE movimiento ADD COLUMN stockmov_id INTEGER"))
-        if 'comp_tipo' not in mov_cols:
-            db.session.execute(text("ALTER TABLE movimiento ADD COLUMN comp_tipo VARCHAR(30)"))
-        if 'comp_nro' not in mov_cols:
-            db.session.execute(text("ALTER TABLE movimiento ADD COLUMN comp_nro VARCHAR(40)"))
-        if 'subcomision_id' not in mov_cols:
-            db.session.execute(text("ALTER TABLE movimiento ADD COLUMN subcomision_id INTEGER"))
-        if 'categoria_id' not in mov_cols:
-            db.session.execute(text("ALTER TABLE movimiento ADD COLUMN categoria_id INTEGER"))
+        # ---------- Mini-migraciones: SOLO para SQLite ----------
+        if is_sqlite:
+            # Socio: cuota_mensual
+            if 'cuota_mensual' not in _sqlite_cols('socio'):
+                db.session.execute(text("ALTER TABLE socio ADD COLUMN cuota_mensual FLOAT DEFAULT 0.0"))
 
-        # Evento: nuevas columnas
-        ev_cols = _sqlite_cols('evento')
-        if 'subcomision_id' not in ev_cols:
-            db.session.execute(text("ALTER TABLE evento ADD COLUMN subcomision_id INTEGER"))
-        if 'presupuesto_ing' not in ev_cols:
-            db.session.execute(text("ALTER TABLE evento ADD COLUMN presupuesto_ing FLOAT DEFAULT 0.0"))
-        if 'presupuesto_egr' not in ev_cols:
-            db.session.execute(text("ALTER TABLE evento ADD COLUMN presupuesto_egr FLOAT DEFAULT 0.0"))
-        if 'notas' not in ev_cols:
-            db.session.execute(text("ALTER TABLE evento ADD COLUMN notas VARCHAR(255)"))
+            # Movimiento: columnas nuevas
+            mov_cols = _sqlite_cols('movimiento')
+            if 'origen' not in mov_cols:
+                db.session.execute(text("ALTER TABLE movimiento ADD COLUMN origen VARCHAR(20) DEFAULT 'manual'"))
+            if 'socio_id' not in mov_cols:
+                db.session.execute(text("ALTER TABLE movimiento ADD COLUMN socio_id INTEGER"))
+            if 'cuota_id' not in mov_cols:
+                db.session.execute(text("ALTER TABLE movimiento ADD COLUMN cuota_id INTEGER"))
+            if 'stockmov_id' not in mov_cols:
+                db.session.execute(text("ALTER TABLE movimiento ADD COLUMN stockmov_id INTEGER"))
+            if 'comp_tipo' not in mov_cols:
+                db.session.execute(text("ALTER TABLE movimiento ADD COLUMN comp_tipo VARCHAR(30)"))
+            if 'comp_nro' not in mov_cols:
+                db.session.execute(text("ALTER TABLE movimiento ADD COLUMN comp_nro VARCHAR(40)"))
+            if 'subcomision_id' not in mov_cols:
+                db.session.execute(text("ALTER TABLE movimiento ADD COLUMN subcomision_id INTEGER"))
+            if 'categoria_id' not in mov_cols:
+                db.session.execute(text("ALTER TABLE movimiento ADD COLUMN categoria_id INTEGER"))
 
-        db.session.commit()
+            # Evento: nuevas columnas
+            ev_cols = _sqlite_cols('evento')
+            if 'subcomision_id' not in ev_cols:
+                db.session.execute(text("ALTER TABLE evento ADD COLUMN subcomision_id INTEGER"))
+            if 'presupuesto_ing' not in ev_cols:
+                db.session.execute(text("ALTER TABLE evento ADD COLUMN presupuesto_ing FLOAT DEFAULT 0.0"))
+            if 'presupuesto_egr' not in ev_cols:
+                db.session.execute(text("ALTER TABLE evento ADD COLUMN presupuesto_egr FLOAT DEFAULT 0.0"))
+            if 'notas' not in ev_cols:
+                db.session.execute(text("ALTER TABLE evento ADD COLUMN notas VARCHAR(255)"))
 
-        # Seed Subcomisiones base
-        base_subs = ['Directiva','Shabibat','Escuela','Cultura','Bienestar']
+            db.session.commit()
+        # ---------- fin bloque SOLO SQLite ----------
+
+        # Semillas fijas de Subcomisiones
+        base_subs = ['Directiva', 'Shabibat', 'Escuela', 'Cultura', 'Bienestar']
         existentes = {s.nombre for s in Subcomision.query.all()}
         for n in base_subs:
             if n not in existentes:
                 db.session.add(Subcomision(nombre=n, activo=True))
         db.session.commit()
 
-        # Seed Categorías globales si no hay
+        # Semillas de Categorías (si no hay ninguna)
         if Categoria.query.count() == 0:
             for n in INGRESO_CATS_SEED:
-                db.session.add(Categoria(nombre=n, tipo='ingreso', subcomision_id=None, activo=True))
+                db.session.add(Categoria(nombre=n, tipo='ingreso', subcomision_id=None))
             for n in SALIDA_CATS_SEED:
-                db.session.add(Categoria(nombre=n, tipo='salida', subcomision_id=None, activo=True))
+                db.session.add(Categoria(nombre=n, tipo='salida', subcomision_id=None))
             db.session.commit()
+
 
 init_db_and_migrate()
 
@@ -1150,6 +1169,12 @@ def eventos():
     } for e in evs_model]
 
     socios = Socio.query.order_by(Socio.nombre.asc()).all()
+    # después de calcular 'evs' y 'socios'
+    try:
+        plant_email = PlantillaCom.query.filter_by(msj_tipo='email').order_by(PlantillaCom.id.desc()).all()
+        plant_whatsapp = PlantillaCom.query.filter_by(msj_tipo='whatsapp').order_by(PlantillaCom.id.desc()).all()
+    except Exception:
+        plant_email, plant_whatsapp = [], []
 
     body = render("""
     <div class="d-flex justify-content-between align-items-center mb-3">
@@ -1642,29 +1667,66 @@ def morosidad():
 @app.post('/morosidad/recordatorios')
 @login_required
 def enviar_recordatorios():
-    via = request.form.get('via')  # 'email' | 'whatsapp'
+    via = (request.form.get('via') or 'email').lower()
     hoy = date.today()
     vencidas = Cuota.query.filter(Cuota.pagada==False, Cuota.fecha_venc < hoy).all()
 
-    enviados, errores = 0, 0
+    # total por socio (para {{deuda_total}})
+    totales = {}
+    for c in vencidas:
+        totales[c.socio_id] = totales.get(c.socio_id, 0.0) + (c.monto or 0.0)
+
+    # tomar última plantilla del tipo correspondiente (si existe)
+    tpl = None
+    try:
+        if via == 'email':
+            tpl = PlantillaCom.query.filter_by(msj_tipo='email').order_by(PlantillaCom.id.desc()).first()
+        else:
+            tpl = PlantillaCom.query.filter_by(msj_tipo='whatsapp').order_by(PlantillaCom.id.desc()).first()
+    except Exception:
+        tpl = None
+
+    enviados, errores = 0, []
     for c in vencidas:
         s = Socio.query.get(c.socio_id)
-        if not s: continue
-        mensaje = (f"Hola {s.nombre},<br>"
-                   f"Tenés cuotas pendientes en la Asociación.<br>"
-                   f"- Período: {c.periodo}<br>- Vencimiento: {c.fecha_venc.strftime('%d/%m/%Y')}<br>"
-                   f"- Importe: ${c.monto:,.2f}<br><br>"
-                   "Te pedimos regularizar a la brevedad. Gracias.<br>ACP Rosario")
-        if via == 'email' and s.email:
-            ok, _ = send_email(s.email, "Recordatorio de cuota pendiente", mensaje)
-        elif via == 'whatsapp' and s.telefono:
-            ok, _ = send_whatsapp(s.telefono, mensaje)
-        else:
-            ok = False
-        enviados += 1 if ok else 0
-        errores += 0 if ok else 1
+        if not s:
+            continue
+        ctx = {
+            'nombre': s.nombre or '',
+            'deuda_total': f"{totales.get(s.id, 0.0):.2f}",
+            'periodo': c.periodo,
+            'vencimiento': c.fecha_venc.strftime('%d/%m/%Y'),
+            'importe': f"{c.monto:.2f}",
+        }
 
-    flash(f'Recordatorios enviados: {enviados}. Errores: {errores}')
+        if via == 'email':
+            if not s.email:
+                errores.append((s.nombre, 'sin email')); continue
+            if tpl:
+                subject = render_vars(getattr(tpl, 'asunto', '') or "Recordatorio de cuota", ctx)
+                body    = render_vars(getattr(tpl, 'cuerpo', ''), ctx)
+            else:
+                subject = "Recordatorio de cuota pendiente"
+                body = (f"Hola {s.nombre},\n\n"
+                        f"Tenés cuotas pendientes.\n"
+                        f"- Período: {c.periodo}\n- Vencimiento: {ctx['vencimiento']}\n"
+                        f"- Importe: ${ctx['importe']}\n- Deuda total: ${ctx['deuda_total']}\n\n"
+                        "Gracias.\nACP")
+            ok, info = send_email(s.email, subject, body)
+        else:
+            if not s.telefono:
+                errores.append((s.nombre, 'sin teléfono')); continue
+            if tpl:
+                body = render_vars(getattr(tpl, 'cuerpo', ''), ctx)
+            else:
+                body = (f"Hola {s.nombre}, tenés cuotas pendientes. "
+                        f"Período {c.periodo} (${ctx['importe']}). Deuda total: ${ctx['deuda_total']}. Gracias.")
+            ok, info = send_whatsapp(s.telefono, body)
+
+        enviados += 1 if ok else 0
+        if not ok: errores.append((s.nombre, info))
+
+    flash(f'Recordatorios enviados: {enviados}. Errores: {len(errores)}')
     return redirect(url_for('morosidad'))
 
 # --------------------
