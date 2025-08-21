@@ -1,16 +1,15 @@
 # app.py — ACP Gestión (Flask 3+) — dotenv + Libro único + comprobante texto en Movimientos
-from sqlalchemy.engine import make_url
+# app.py — ACP Gestión
 from __future__ import annotations
 
+import os, csv, json, re
 from datetime import datetime, date
 from calendar import monthrange
 from functools import wraps
 from io import StringIO
-import os, csv, json, re
-
 
 from dotenv import load_dotenv
-load_dotenv()  # carga variables de .env si existe
+load_dotenv()
 
 from flask import (
     Flask, request, redirect, url_for, session, flash, Response,
@@ -20,7 +19,7 @@ from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from sqlalchemy import text, func, or_
-
+from sqlalchemy.engine import make_url  # << necesario
 # --------------------
 # Configuración
 # --------------------
@@ -30,6 +29,9 @@ app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
     'DATABASE_URL',
     os.getenv('SQLALCHEMY_DATABASE_URI', 'sqlite:///asociacion.db')
 )
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+
 
 # Archivos de cuotas (comprobantes adjuntos)
 app.config['UPLOAD_FOLDER'] = os.path.join('static', 'comprobantes')
@@ -176,8 +178,8 @@ class PlantillaCom(db.Model):
 # --------------------
 # Inicialización + mini-migraciones
 # --------------------
-
 def _sqlite_cols(table_name: str) -> set[str]:
+    # Solo en SQLite; en otros motores no ejecutar PRAGMA
     try:
         if make_url(app.config['SQLALCHEMY_DATABASE_URI']).get_backend_name() != 'sqlite':
             return set()
@@ -186,31 +188,30 @@ def _sqlite_cols(table_name: str) -> set[str]:
     rows = db.session.execute(text(f'PRAGMA table_info("{table_name}")')).fetchall()
     return {r[1] for r in rows}
 
-is_sqlite = make_url(app.config.get('SQLALCHEMY_DATABASE_URI', 'sqlite:///')).get_backend_name() == 'sqlite'
-
-
 def init_db_and_migrate():
     with app.app_context():
-        # Crear tablas nuevas según los modelos
+        # Crear tablas según modelos
         db.create_all()
 
-        # Seed usuario admin
+        # Seed admin
         if not User.query.filter_by(username='admin').first():
             u = User(username='admin', role='admin')
             u.set_password('admin123')
             db.session.add(u)
             db.session.commit()
 
-        # Detectar motor
-        is_sqlite = app.config.get('SQLALCHEMY_DATABASE_URI', '').startswith('sqlite:')
+        # ¿Estamos en SQLite?
+        is_sqlite = make_url(
+            app.config.get('SQLALCHEMY_DATABASE_URI', 'sqlite:///')
+        ).get_backend_name() == 'sqlite'
 
-        # ---------- Mini-migraciones: SOLO para SQLite ----------
+        # ---- Mini-migraciones SOLO en SQLite ----
         if is_sqlite:
-            # Socio: cuota_mensual
+            # Socio
             if 'cuota_mensual' not in _sqlite_cols('socio'):
                 db.session.execute(text("ALTER TABLE socio ADD COLUMN cuota_mensual FLOAT DEFAULT 0.0"))
 
-            # Movimiento: columnas nuevas
+            # Movimiento
             mov_cols = _sqlite_cols('movimiento')
             if 'origen' not in mov_cols:
                 db.session.execute(text("ALTER TABLE movimiento ADD COLUMN origen VARCHAR(20) DEFAULT 'manual'"))
@@ -229,7 +230,7 @@ def init_db_and_migrate():
             if 'categoria_id' not in mov_cols:
                 db.session.execute(text("ALTER TABLE movimiento ADD COLUMN categoria_id INTEGER"))
 
-            # Evento: nuevas columnas
+            # Evento
             ev_cols = _sqlite_cols('evento')
             if 'subcomision_id' not in ev_cols:
                 db.session.execute(text("ALTER TABLE evento ADD COLUMN subcomision_id INTEGER"))
@@ -241,24 +242,23 @@ def init_db_and_migrate():
                 db.session.execute(text("ALTER TABLE evento ADD COLUMN notas VARCHAR(255)"))
 
             db.session.commit()
-        # ---------- fin bloque SOLO SQLite ----------
+        # ---- fin SOLO SQLite ----
 
-        # Semillas fijas de Subcomisiones
+        # Semillas: subcomisiones fijas
         base_subs = ['Directiva', 'Shabibat', 'Escuela', 'Cultura', 'Bienestar']
         existentes = {s.nombre for s in Subcomision.query.all()}
         for n in base_subs:
             if n not in existentes:
                 db.session.add(Subcomision(nombre=n, activo=True))
-        db.session.commit()
 
-        # Semillas de Categorías (si no hay ninguna)
+        # Semillas: categorías globales
         if Categoria.query.count() == 0:
             for n in INGRESO_CATS_SEED:
-                db.session.add(Categoria(nombre=n, tipo='ingreso', subcomision_id=None))
+                db.session.add(Categoria(nombre=n, tipo='ingreso', subcomision_id=None, activo=True))
             for n in SALIDA_CATS_SEED:
-                db.session.add(Categoria(nombre=n, tipo='salida', subcomision_id=None))
-            db.session.commit()
+                db.session.add(Categoria(nombre=n, tipo='salida', subcomision_id=None, activo=True))
 
+        db.session.commit()
 
 init_db_and_migrate()
 
@@ -1667,16 +1667,16 @@ def morosidad():
 @app.post('/morosidad/recordatorios')
 @login_required
 def enviar_recordatorios():
-    via = (request.form.get('via') or 'email').lower()
+    via = (request.form.get('via') or 'email').lower()  # 'email' | 'whatsapp'
     hoy = date.today()
-    vencidas = Cuota.query.filter(Cuota.pagada==False, Cuota.fecha_venc < hoy).all()
+    vencidas = Cuota.query.filter(Cuota.pagada == False, Cuota.fecha_venc < hoy).all()
 
-    # total por socio (para {{deuda_total}})
+    # Total por socio para variables
     totales = {}
     for c in vencidas:
         totales[c.socio_id] = totales.get(c.socio_id, 0.0) + (c.monto or 0.0)
 
-    # tomar última plantilla del tipo correspondiente (si existe)
+    # Última plantilla del tipo (si existe)
     tpl = None
     try:
         if via == 'email':
@@ -1686,47 +1686,49 @@ def enviar_recordatorios():
     except Exception:
         tpl = None
 
-    enviados, errores = 0, []
+    enviados = 0
+    errores = []  # lista de (socio, motivo)
+
     for c in vencidas:
         s = Socio.query.get(c.socio_id)
         if not s:
             continue
+
         ctx = {
             'nombre': s.nombre or '',
             'deuda_total': f"{totales.get(s.id, 0.0):.2f}",
             'periodo': c.periodo,
             'vencimiento': c.fecha_venc.strftime('%d/%m/%Y'),
-            'importe': f"{c.monto:.2f}",
+            'importe': f"{(c.monto or 0.0):.2f}",
         }
 
         if via == 'email':
             if not s.email:
                 errores.append((s.nombre, 'sin email')); continue
+            subject = "Recordatorio de cuota"
+            body = (f"Hola {s.nombre},\n\n"
+                    f"Tenés cuotas pendientes.\n- Período: {ctx['periodo']}\n"
+                    f"- Vencimiento: {ctx['vencimiento']}\n- Importe: ${ctx['importe']}\n"
+                    f"- Deuda total: ${ctx['deuda_total']}\n\nGracias.\nACP")
             if tpl:
-                subject = render_vars(getattr(tpl, 'asunto', '') or "Recordatorio de cuota", ctx)
-                body    = render_vars(getattr(tpl, 'cuerpo', ''), ctx)
-            else:
-                subject = "Recordatorio de cuota pendiente"
-                body = (f"Hola {s.nombre},\n\n"
-                        f"Tenés cuotas pendientes.\n"
-                        f"- Período: {c.periodo}\n- Vencimiento: {ctx['vencimiento']}\n"
-                        f"- Importe: ${ctx['importe']}\n- Deuda total: ${ctx['deuda_total']}\n\n"
-                        "Gracias.\nACP")
+                subject = render_vars(getattr(tpl, 'asunto', subject), ctx)
+                body    = render_vars(getattr(tpl, 'cuerpo_html', '') or getattr(tpl, 'cuerpo', body), ctx)
             ok, info = send_email(s.email, subject, body)
         else:
             if not s.telefono:
                 errores.append((s.nombre, 'sin teléfono')); continue
+            body = (f"Hola {s.nombre}, tenés cuotas pendientes. Período {ctx['periodo']} "
+                    f"(${ctx['importe']}). Deuda total: ${ctx['deuda_total']}. Gracias.")
             if tpl:
-                body = render_vars(getattr(tpl, 'cuerpo', ''), ctx)
-            else:
-                body = (f"Hola {s.nombre}, tenés cuotas pendientes. "
-                        f"Período {c.periodo} (${ctx['importe']}). Deuda total: ${ctx['deuda_total']}. Gracias.")
+                body = render_vars(getattr(tpl, 'cuerpo_html', '') or getattr(tpl, 'cuerpo', body), ctx)
             ok, info = send_whatsapp(s.telefono, body)
 
-        enviados += 1 if ok else 0
-        if not ok: errores.append((s.nombre, info))
+        if ok:
+            enviados += 1
+        else:
+            errores.append((s.nombre, info))
 
-    flash(f'Recordatorios enviados: {enviados}. Errores: {len(errores)}')
+    flash(f"Recordatorios enviados: {enviados}. Errores: {len(errores)}")
     return redirect(url_for('morosidad'))
 
 # --------------------
