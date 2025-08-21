@@ -20,6 +20,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from sqlalchemy import text, func, or_
 from sqlalchemy.engine import make_url  # << necesario
+
 # --------------------
 # Configuración
 # --------------------
@@ -326,6 +327,13 @@ def render_vars(s: str, ctx: dict) -> str:
     def _repl(m): 
         return str(ctx.get(m.group(1).strip(), ""))
     return re.sub(r"{{\s*([^}]+?)\s*}}", _repl, s)
+
+
+
+def month_key(col):
+    """Devuelve YYYY-MM de una fecha, compatible con SQLite y Postgres."""
+    backend = make_url(app.config['SQLALCHEMY_DATABASE_URI']).get_backend_name()
+    return func.strftime('%Y-%m', col) if backend == 'sqlite' else func.to_char(col, 'YYYY-MM')
 
 # --------------------
 # Layout (logo grande + oliva)
@@ -1609,60 +1617,67 @@ def revertir_pago(cuota_id):
 @login_required
 def morosidad():
     hoy = date.today()
-    vencidas = Cuota.query.filter(Cuota.pagada==False, Cuota.fecha_venc < hoy).all()
-    deudas = {}
-    for c in vencidas:
-        deudas.setdefault(c.socio_id, {'monto':0.0,'cuotas':[]})
-        deudas[c.socio_id]['monto'] += c.monto
-        deudas[c.socio_id]['cuotas'].append(c)
-    socios_map = {s.id: s.nombre for s in Socio.query.with_entities(Socio.id, Socio.nombre).all()}
-    total = sum(v['monto'] for v in deudas.values())
 
+    # Deuda vencida por socio (sumatoria)
+    q = (
+        db.session.query(
+            Socio.id.label('socio_id'),
+            Socio.nombre.label('socio_nombre'),
+            func.coalesce(func.sum(Cuota.monto), 0).label('deuda_total'),
+            func.count(Cuota.id).label('cuotas_vencidas')
+        )
+        .join(Cuota, Cuota.socio_id == Socio.id)
+        .filter(Cuota.pagada == False, Cuota.fecha_venc < hoy)
+        .group_by(Socio.id, Socio.nombre)
+        .order_by(Socio.nombre.asc())
+    )
+    deudores = q.all()
+
+    # Agrupación por período YYYY-MM (sin strftime)
+    q_periodos = (
+        db.session.query(
+            month_key(Cuota.fecha_venc).label('periodo'),
+            func.coalesce(func.sum(Cuota.monto), 0).label('importe')
+        )
+        .filter(Cuota.pagada == False, Cuota.fecha_venc < hoy)
+        .group_by(month_key(Cuota.fecha_venc))
+        .order_by(month_key(Cuota.fecha_venc).asc())
+    )
+    periodos = q_periodos.all()
+
+    # Render rápido (tu template puede ser otro; mantené la acción del form)
     body = render("""
-    <div class="d-flex justify-content-between align-items-center mb-3">
-      <h3 class="text-oliva">Morosidad</h3>
-      <div class="d-flex gap-2">
-        <form method="post" action="{{ url_for('enviar_recordatorios') }}">
-          <input type="hidden" name="via" value="email"><button class="btn btn-sm btn-oliva">Recordar por Email</button>
-        </form>
-        <form method="post" action="{{ url_for('enviar_recordatorios') }}">
-          <input type="hidden" name="via" value="whatsapp"><button class="btn btn-sm btn-outline-dark">Recordar por WhatsApp</button>
-        </form>
+    <h3>Morosidad</h3>
+    <form method="post" action="{{ url_for('enviar_recordatorios') }}">
+      <div class="mb-2">
+        <label>Enviar por:</label>
+        <select name="via" class="form-select" style="max-width:200px">
+          <option value="email">Email</option>
+          <option value="whatsapp">WhatsApp</option>
+        </select>
       </div>
-    </div>
-
-    <div class="mb-3"><span class="badge text-bg-danger">Total adeudado: $ {{ '%.2f' % total }}</span></div>
-
-    {% if not deudas %}<div class="alert alert-success">No hay cuotas vencidas.</div>
-    {% else %}
-      {% for sid, info in deudas.items() %}
-        <div class="card mb-3">
-          <div class="card-header d-flex justify-content-between">
-            <strong>{{ socios_map.get(sid, '#'+sid|string) }}</strong>
-            <span>Deuda: <strong>$ {{ '%.2f' % info.monto }}</strong></span>
-          </div>
-          <div class="card-body table-responsive">
-            <table class="table table-sm align-middle mb-0">
-              <thead><tr><th>Período</th><th>Vencimiento</th><th class="text-end">Monto</th><th></th></tr></thead>
-              <tbody>
-                {% for c in info.cuotas %}
-                  <tr>
-                    <td>{{ c.periodo }}</td>
-                    <td>{{ c.fecha_venc.strftime('%d/%m/%Y') }}</td>
-                    <td class="text-end">$ {{ '%.2f' % c.monto }}</td>
-                    <td class="text-end">
-                      <a class="btn btn-sm btn-oliva" href="{{ url_for('cuotas', periodo=c.periodo) }}">Gestionar</a>
-                    </td>
-                  </tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-        </div>
+      <button class="btn btn-primary">Enviar recordatorios</button>
+    </form>
+    <hr>
+    <h5>Deudores (vencidas)</h5>
+    <table class="table table-sm">
+      <thead><tr><th>Socio</th><th>#Cuotas</th><th>Deuda</th></tr></thead>
+      <tbody>
+        {% for r in deudores %}
+          <tr><td>{{r.socio_nombre}}</td><td>{{r.cuotas_vencidas}}</td>
+              <td>${{ '%.2f'|format(r.deuda_total or 0) }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <h6>Por período</h6>
+    <ul>
+      {% for p in periodos %}
+        <li>{{p.periodo}} — ${{ '%.2f'|format(p.importe or 0) }}</li>
       {% endfor %}
-    {% endif %}
-    """, deudas=deudas, socios_map=socios_map, total=total)
-    return page(body, title='Morosidad')
+    </ul>
+    """, deudores=deudores, periodos=periodos)
+
+    return body
 
 @app.post('/morosidad/recordatorios')
 @login_required
