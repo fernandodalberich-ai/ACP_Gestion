@@ -21,8 +21,7 @@ from werkzeug.utils import secure_filename
 from sqlalchemy import text, func, or_
 from sqlalchemy.engine import make_url  # << necesario
 
-# imports arriba
-from sqlalchemy import UniqueConstraint, Boolean
+
 
 
 # --------------------
@@ -179,22 +178,22 @@ class PlantillaCom(db.Model):
     asunto = db.Column(db.String(160))
     cuerpo_html = db.Column(db.Text, nullable=False)     # usamos HTML también para WA (se limpiará)
     variables_json = db.Column(db.Text, default='[]')    # ayuda para UI (lista de variables disponibles)
-
+cuerpo_c
 
 class UsuarioSubcomision(db.Model):
     __tablename__ = "usuario_subcomision"
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
     subcomision_id = db.Column(db.Integer, db.ForeignKey("subcomision.id"), nullable=False, index=True)
-    rol_local = db.Column(db.String(30))  # p.ej. responsable, editor, lector
-    activo = db.Column(Boolean, nullable=False, default=True)
+    rol_local = db.Column(db.String(30))
+    activo = db.Column(db.Boolean, nullable=False, default=True)
 
-    __table_args__ = (UniqueConstraint("user_id","subcomision_id","activo",
-                                       name="uq_user_sub_activo"),)
+    __table_args__ = (
+        db.UniqueConstraint("user_id", "subcomision_id", "activo", name="uq_user_sub_activo"),
+    )
 
     user = db.relationship("User", backref=db.backref("sub_asignadas", lazy="dynamic"))
     subcomision = db.relationship("Subcomision")
-
 # --------------------
 # Inicialización + mini-migraciones
 # --------------------
@@ -1633,19 +1632,21 @@ def com_evento_enviar(evento_id):
             "fecha": e.fecha.strftime("%d/%m/%Y"),
         }
 
-        cuerpo_tpl = (tpl.cuerpo_html if (tpl and tpl.cuerpo_html)
-                      else "Hola {{ nombre }}, te contactamos por el evento {{ evento }} del {{ fecha }}.")
-        cuerpo = render_vars(cuerpo_tpl, ctx)
 
+
+        cuerpo_tpl = tpl.cuerpo_html if tpl else "Hola {{nombre}}, te contactamos por el evento {{evento}} del {{fecha}}."
+        ctx = {"nombre": nombre, "evento": e.titulo, "fecha": e.fecha.strftime("%d/%m/%Y")}
+        cuerpo = render_vars(cuerpo_tpl, ctx)
         if via == 'email' and s.email:
-            asunto_base = (tpl.asunto if (tpl and tpl.asunto) else f"Evento: {e.titulo}")
-            asunto = render_vars(asunto_base, ctx)
+            asunto_base = f"Evento: {e.titulo}"
+            asunto = render_vars(tpl.asunto, ctx) if (tpl and tpl.asunto) else asunto_base
             ok, _ = send_email(s.email, asunto, cuerpo)
         elif via == 'whatsapp' and s.telefono:
             ok, _ = send_whatsapp(s.telefono, cuerpo)
         else:
             ok = False
 
+       
         enviados += 1 if ok else 0
         errores += 0 if ok else 1
 
