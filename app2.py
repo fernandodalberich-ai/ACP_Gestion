@@ -21,6 +21,10 @@ from werkzeug.utils import secure_filename
 from sqlalchemy import text, func, or_
 from sqlalchemy.engine import make_url  # << necesario
 
+# imports arriba
+from sqlalchemy import UniqueConstraint, Boolean
+
+
 # --------------------
 # Configuración
 # --------------------
@@ -176,6 +180,21 @@ class PlantillaCom(db.Model):
     cuerpo_html = db.Column(db.Text, nullable=False)     # usamos HTML también para WA (se limpiará)
     variables_json = db.Column(db.Text, default='[]')    # ayuda para UI (lista de variables disponibles)
 
+
+class UsuarioSubcomision(db.Model):
+    __tablename__ = "usuario_subcomision"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    subcomision_id = db.Column(db.Integer, db.ForeignKey("subcomision.id"), nullable=False, index=True)
+    rol_local = db.Column(db.String(30))  # p.ej. responsable, editor, lector
+    activo = db.Column(Boolean, nullable=False, default=True)
+
+    __table_args__ = (UniqueConstraint("user_id","subcomision_id","activo",
+                                       name="uq_user_sub_activo"),)
+
+    user = db.relationship("User", backref=db.backref("sub_asignadas", lazy="dynamic"))
+    subcomision = db.relationship("Subcomision")
+
 # --------------------
 # Inicialización + mini-migraciones
 # --------------------
@@ -318,6 +337,23 @@ def send_whatsapp(to_e164, body):
     except Exception as e:
         return False, str(e)
 
+def is_admin():
+    return (session.get('role') or '').lower() == 'admin'
+
+def sub_ids_del_usuario(user_id:int) -> set[int] | None:
+    if is_admin():
+        return None   # sin restricción
+    rows = UsuarioSubcomision.query.filter_by(user_id=user_id, activo=True).all()
+    return {r.subcomision_id for r in rows}
+
+def scope_por_subcom(q, col_sub_id):
+    """Si no es admin, filtra por las subcomisiones asignadas."""
+    if is_admin():
+        return q
+    subs = sub_ids_del_usuario(session.get('user_id'))
+    if not subs:      # sin asignaciones => no ve nada
+        return q.filter(col_sub_id == -1)
+    return q.filter(col_sub_id.in_(list(subs)))
 
 
 def render_vars(s: str, ctx: dict) -> str:
@@ -532,44 +568,52 @@ def nuevo_usuario():
 def editar_usuario(uid):
     u = User.query.get_or_404(uid)
     if request.method == 'POST':
-        u.role = request.form['role']
-        newpwd = (request.form.get('password') or '').strip()
-        if newpwd:
-            if len(newpwd) < 10:
+        nuevo_user = request.form['username'].strip()
+        nuevo_rol  = request.form['role']
+        new_pwd    = (request.form.get('password') or '').strip()
+        if User.query.filter(User.username==nuevo_user, User.id!=u.id).first():
+            flash('Nombre de usuario ya en uso'); return redirect(url_for('editar_usuario', uid=uid))
+        u.username = nuevo_user
+        u.role = nuevo_rol
+        if new_pwd:
+            if len(new_pwd) < 10:
                 flash('La contraseña debe tener al menos 10 caracteres'); return redirect(url_for('editar_usuario', uid=uid))
-            u.set_password(newpwd)
-        db.session.commit(); flash('Usuario actualizado')
-        return redirect(url_for('usuarios'))
+            u.set_password(new_pwd)
+        db.session.commit(); flash('Usuario actualizado'); return redirect(url_for('usuarios'))
+
     body = render("""
     <h3 class="text-oliva">Editar usuario</h3>
     <form method="post" class="card"><div class="card-body row g-2">
-      <div class="col-md-4"><input class="form-control" value="{{ u.username }}" disabled></div>
-      <div class="col-md-3"><select class="form-select" name="role">
-        <option value="admin" {{ 'selected' if u.role=='admin' else '' }}>admin</option>
-        <option value="operador" {{ 'selected' if u.role=='operador' else '' }}>operador</option>
-        <option value="consulta" {{ 'selected' if u.role=='consulta' else '' }}>consulta</option>
-      </select></div>
-      <div class="col-md-4"><input type="password" class="form-control" name="password" placeholder="Nueva contraseña (opcional, min 10)"></div>
-    </div><div class="card-footer d-flex gap-2">
-      <a class="btn btn-secondary" href="{{ url_for('usuarios') }}">Volver</a>
-      <button class="btn btn-oliva">Guardar</button></div></form>
+      <div class="col-md-4"><input class="form-control" name="username" value="{{ u.username }}" required></div>
+      <div class="col-md-3">
+        <select class="form-select" name="role">
+          {% for r in ['admin','operador','consulta'] %}
+            <option value="{{r}}" {{ 'selected' if u.role==r else '' }}>{{r}}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-md-5"><input type="password" class="form-control" name="password" placeholder="Nueva contraseña (opcional)"></div>
+    </div><div class="card-footer d-flex gap-2 justify-content-end">
+      <a class="btn btn-secondary" href="{{ url_for('usuarios') }}">Cancelar</a>
+      <button class="btn btn-oliva">Guardar</button>
+    </div></form>
     """, u=u)
     return page(body, title='Editar usuario')
+
 
 @app.get('/usuarios/<int:uid>/eliminar')
 @login_required
 @role_required('admin')
 def eliminar_usuario(uid):
-    if uid == session.get('uid'):
-        flash('No podés borrarte a vos mismo.'); return redirect(url_for('usuarios'))
+    if session.get('uid') == uid:
+        flash('No podés eliminarte a vos mismo'); return redirect(url_for('usuarios'))
     u = User.query.get_or_404(uid)
-    # impedir eliminar último admin
-    if u.role == 'admin':
-        otros_admins = User.query.filter(User.role=='admin', User.id!=u.id).count()
-        if otros_admins == 0:
-            flash('No se puede eliminar el último admin.'); return redirect(url_for('usuarios'))
+    # Evitar borrar último admin
+    if u.role == 'admin' and User.query.filter_by(role='admin').count() <= 1:
+        flash('No se puede eliminar el último admin'); return redirect(url_for('usuarios'))
     db.session.delete(u); db.session.commit()
     flash('Usuario eliminado'); return redirect(url_for('usuarios'))
+
 
 # --------------------
 # Subcomisiones (admin)
@@ -1463,21 +1507,34 @@ def com_evento_enviar(evento_id):
 
     insc = Inscripcion.query.filter_by(evento_id=e.id).all()
     enviados, errores = 0, 0
+
     for i in insc:
         s = Socio.query.get(i.socio_id)
-        if not s: continue
-        nombre = s.nombre
-        cuerpo = tpl.cuerpo_html if tpl else "Hola {{nombre}}, te contactamos por el evento {{evento}} del {{fecha}}."
-        cuerpo = render_vars(cuerpo, nombre=nombre, evento=e.titulo, fecha=e.fecha.strftime('%d/%m/%Y'))
+        if not s:
+            continue
+
+        ctx = {
+            "nombre": s.nombre or "",
+            "evento": e.titulo,
+            "fecha": e.fecha.strftime("%d/%m/%Y"),
+        }
+
+        cuerpo_tpl = (tpl.cuerpo_html if (tpl and tpl.cuerpo_html)
+                      else "Hola {{ nombre }}, te contactamos por el evento {{ evento }} del {{ fecha }}.")
+        cuerpo = render_vars(cuerpo_tpl, ctx)
+
         if via == 'email' and s.email:
-            asunto = tpl.asunto or f"Información: {e.titulo}" if tpl else f"Evento: {e.titulo}"
+            asunto_base = (tpl.asunto if (tpl and tpl.asunto) else f"Evento: {e.titulo}")
+            asunto = render_vars(asunto_base, ctx)
             ok, _ = send_email(s.email, asunto, cuerpo)
         elif via == 'whatsapp' and s.telefono:
             ok, _ = send_whatsapp(s.telefono, cuerpo)
         else:
             ok = False
+
         enviados += 1 if ok else 0
         errores += 0 if ok else 1
+
     flash(f'Envíos a inscritos: {enviados} OK, {errores} errores')
     return redirect(url_for('eventos'))
 
@@ -1618,8 +1675,7 @@ def revertir_pago(cuota_id):
 def morosidad():
     hoy = date.today()
 
-    # Deuda vencida por socio (sumatoria)
-    q = (
+    deudores = (
         db.session.query(
             Socio.id.label('socio_id'),
             Socio.nombre.label('socio_nombre'),
@@ -1630,11 +1686,9 @@ def morosidad():
         .filter(Cuota.pagada == False, Cuota.fecha_venc < hoy)
         .group_by(Socio.id, Socio.nombre)
         .order_by(Socio.nombre.asc())
-    )
-    deudores = q.all()
+    ).all()
 
-    # Agrupación por período YYYY-MM (sin strftime)
-    q_periodos = (
+    periodos = (
         db.session.query(
             month_key(Cuota.fecha_venc).label('periodo'),
             func.coalesce(func.sum(Cuota.monto), 0).label('importe')
@@ -1642,42 +1696,50 @@ def morosidad():
         .filter(Cuota.pagada == False, Cuota.fecha_venc < hoy)
         .group_by(month_key(Cuota.fecha_venc))
         .order_by(month_key(Cuota.fecha_venc).asc())
-    )
-    periodos = q_periodos.all()
+    ).all()
 
-    # Render rápido (tu template puede ser otro; mantené la acción del form)
     body = render("""
     <h3>Morosidad</h3>
     <form method="post" action="{{ url_for('enviar_recordatorios') }}">
-      <div class="mb-2">
-        <label>Enviar por:</label>
-        <select name="via" class="form-select" style="max-width:200px">
-          <option value="email">Email</option>
-          <option value="whatsapp">WhatsApp</option>
-        </select>
-      </div>
-      <button class="btn btn-primary">Enviar recordatorios</button>
+      <label>Enviar por:</label>
+      <select name="via" class="form-select" style="max-width:200px">
+        <option value="email">Email</option>
+        <option value="whatsapp">WhatsApp</option>
+      </select>
+      <button class="btn btn-primary ms-2">Enviar recordatorios</button>
     </form>
     <hr>
     <h5>Deudores (vencidas)</h5>
-    <table class="table table-sm">
-      <thead><tr><th>Socio</th><th>#Cuotas</th><th>Deuda</th></tr></thead>
-      <tbody>
+    {% if deudores %}
+      <table class="table table-sm">
+        <thead><tr><th>Socio</th><th>#Cuotas</th><th>Deuda</th></tr></thead>
+        <tbody>
         {% for r in deudores %}
-          <tr><td>{{r.socio_nombre}}</td><td>{{r.cuotas_vencidas}}</td>
-              <td>${{ '%.2f'|format(r.deuda_total or 0) }}</td></tr>
+          <tr>
+            <td>{{ r.socio_nombre }}</td>
+            <td>{{ r.cuotas_vencidas }}</td>
+            <td>${{ '%.2f'|format(r.deuda_total or 0) }}</td>
+          </tr>
         {% endfor %}
-      </tbody>
-    </table>
-    <h6>Por período</h6>
-    <ul>
-      {% for p in periodos %}
-        <li>{{p.periodo}} — ${{ '%.2f'|format(p.importe or 0) }}</li>
-      {% endfor %}
-    </ul>
+        </tbody>
+      </table>
+    {% else %}
+      <div class="text-muted">No hay cuotas vencidas.</div>
+    {% endif %}
+
+    <h6 class="mt-3">Por período</h6>
+    {% if periodos %}
+      <ul class="mb-4">
+        {% for p in periodos %}
+          <li>{{ p.periodo }} — ${{ '%.2f'|format(p.importe or 0) }}</li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <div class="text-muted">Sin períodos con deuda.</div>
+    {% endif %}
     """, deudores=deudores, periodos=periodos)
 
-    return body
+    return page(body, title='Morosidad')
 
 @app.post('/morosidad/recordatorios')
 @login_required
