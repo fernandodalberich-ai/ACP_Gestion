@@ -7,7 +7,7 @@ from datetime import datetime, date
 from calendar import monthrange
 from functools import wraps
 from io import StringIO
-
+from textwrap import dedent
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -1313,7 +1313,7 @@ def eventos():
         flash('Evento creado')
         return redirect(url_for('eventos'))
 
-    # Lista para template
+    # Lista para template (sin hasattr en Jinja)
     evs_model = Evento.query.order_by(Evento.fecha.desc()).all()
     evs = [{
         'id': e.id,
@@ -1347,6 +1347,7 @@ def eventos():
         <div class="col-md-2"><input class="form-control" type="date" name="fecha" required></div>
         <div class="col-md-3"><input class="form-control" name="lugar" placeholder="Lugar (opcional)"></div>
         <div class="col-md-3"><input class="form-control" name="descripcion" placeholder="Descripción (opcional)"></div>
+
         <div class="col-md-3">
           <select class="form-select" name="subcomision_id">
             <option value="">Sin subcomisión</option>
@@ -1383,6 +1384,7 @@ def eventos():
             </div>
           {% endif %}
 
+          <!-- Inscripciones -->
           <h6 class="text-oliva">Inscripciones</h6>
           <form method="post" action="{{ url_for('inscribir', evento_id=e.id) }}" class="row g-2 mb-3">
             <div class="col-md-9">
