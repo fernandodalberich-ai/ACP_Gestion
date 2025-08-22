@@ -631,29 +631,32 @@ def subcomisiones():
         db.session.add(Subcomision(nombre=nombre, activo=True)); db.session.commit()
         flash('Subcomisión creada'); return redirect(url_for('subcomisiones'))
     subs = Subcomision.query.order_by(Subcomision.activo.desc(), Subcomision.nombre.asc()).all()
-    body = render("""
-    <h3 class="text-oliva">Subcomisiones</h3>
-    <form method="post" class="card mb-3">
-      <div class="card-body d-flex gap-2">
-        <input class="form-control" name="nombre" placeholder="Nueva subcomisión">
-        <button class="btn btn-oliva">Agregar</button>
-      </div>
-    </form>
-    <table class="table table-striped"><thead><tr><th>Nombre</th><th>Activa</th><th class="text-end"></th></tr></thead><tbody>
-    {% for s in subs %}
-      <tr>
-        <td>{{ s.nombre }}</td>
-        <td>{{ 'Sí' if s.activo else 'No' }}</td>
-        <td class="text-end">
-          {% if s.activo %}
-            <a class="btn btn-sm btn-outline-danger" href="{{ url_for('toggle_sub', sid=s.id) }}">Desactivar</a>
-          {% else %}
-            <a class="btn btn-sm btn-oliva" href="{{ url_for('toggle_sub', sid=s.id) }}">Activar</a>
-          {% endif %}
-        </td>
-      </tr>
-    {% endfor %}</tbody></table>
-    """, subs=subs)
+
+     body = render("""
+     <h3 class="text-oliva">Subcomisiones</h3>
+     <form method="post" class="card mb-3">
+       <div class="card-body d-flex gap-2">
+         <input class="form-control" name="nombre" placeholder="Nueva subcomisión">
+         <button class="btn btn-oliva">Agregar</button>
+       </div>
+     </form>
+     <table class="table table-striped"><thead><tr><th>Nombre</th><th>Activa</th><th class="text-end">Acciones</th></tr></thead><tbody>
+     {% for s in subs %}
+       <tr>
+         <td>{{ s.nombre }}</td>
+         <td>{{ 'Sí' if s.activo else 'No' }}</td>
+         <td class="text-end d-flex gap-2 justify-content-end">
+              <a class="btn btn-sm btn-outline-dark" href="{{ url_for('subcomision_miembros', sid=s.id) }}">Miembros</a>
+           {% if s.activo %}
+              <a class="btn btn-sm btn-outline-danger" href="{{ url_for('toggle_sub', sid=s.id) }}">Desactivar</a>
+           {% else %}
+             <a class="btn btn-sm btn-oliva" href="{{ url_for('toggle_sub', sid=s.id) }}">Activar</a>
+           {% endif %}
+         </td>
+       </tr>
+     {% endfor %}</tbody></table>
+     """, subs=subs)
+    
     return page(body, title='Subcomisiones')
 
 @app.get('/subcomisiones/<int:sid>/toggle')
@@ -664,6 +667,117 @@ def toggle_sub(sid):
     s.activo = not s.activo
     db.session.commit()
     return redirect(url_for('subcomisiones'))
+@app.get('/subcomisiones/<int:sid>/miembros')
+@login_required
+@role_required('admin')
+def subcomision_miembros(sid):
+    sub = Subcomision.query.get_or_404(sid)
+    # Asignaciones activas
+    asignados = (db.session.query(UsuarioSubcomision, User)
+                 .join(User, UsuarioSubcomision.user_id == User.id)
+                 .filter(UsuarioSubcomision.subcomision_id == sid,
+                         UsuarioSubcomision.activo == True)
+                 .order_by(User.username.asc())
+                 ).all()
+    # Usuarios disponibles (no asignados activos a esta sub)
+    ya_ids = [a.user_id for a,_ in asignados]
+    disponibles = User.query.filter(~User.id.in_(ya_ids)).order_by(User.username.asc()).all()
+
+    body = render("""
+    <h3 class="text-oliva">Miembros — {{ sub.nombre }}</h3>
+
+    <form method="post" action="{{ url_for('subcomision_add_miembro', sid=sub.id) }}" class="card mb-3" style="max-width:720px">
+      <div class="card-body row g-2">
+        <div class="col-md-6">
+          <select name="user_id" class="form-select" required>
+            <option value="">-- Usuario --</option>
+            {% for u in disponibles %}
+              <option value="{{u.id}}">{{u.username}} ({{u.role}})</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-md-4">
+          <input name="rol_local" class="form-control" placeholder="Rol en la sub (opcional)">
+        </div>
+        <div class="col-md-2 text-end">
+          <button class="btn btn-oliva w-100">Agregar</button>
+        </div>
+      </div>
+    </form>
+
+    <div class="table-responsive"><table class="table table-sm align-middle">
+      <thead><tr><th>Usuario</th><th>Rol global</th><th>Rol en sub</th><th class="text-end">Acciones</th></tr></thead>
+      <tbody>
+        {% for a,u in asignados %}
+          <tr>
+            <td>{{ u.username }}</td>
+            <td><span class="badge text-bg-light">{{ u.role }}</span></td>
+            <td>
+              <form method="post" action="{{ url_for('subcomision_set_rol', sid=sub.id) }}" class="d-flex gap-2">
+                <input type="hidden" name="asid" value="{{ a.id }}">
+                <input name="rol_local" class="form-control form-control-sm" style="max-width:240px" value="{{ a.rol_local or '' }}" placeholder="Rol en la sub">
+                <button class="btn btn-sm btn-outline-dark">Guardar</button>
+              </form>
+            </td>
+            <td class="text-end">
+              <form method="post" action="{{ url_for('subcomision_remove_miembro', sid=sub.id) }}" style="display:inline">
+                <input type="hidden" name="asid" value="{{ a.id }}">
+                <button class="btn btn-sm btn-outline-danger" onclick="return confirm('Quitar miembro?')">Quitar</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table></div>
+
+    <p><a class="btn btn-secondary" href="{{ url_for('subcomisiones') }}">&larr; Volver</a></p>
+    """, sub=sub, asignados=asignados, disponibles=disponibles)
+    return page(body, title=f"Miembros — {sub.nombre}")
+
+
+@app.post('/subcomisiones/<int:sid>/miembros/add')
+@login_required
+@role_required('admin')
+def subcomision_add_miembro(sid):
+    Subcomision.query.get_or_404(sid)
+    user_id = int(request.form['user_id'])
+    rol_local = (request.form.get('rol_local') or '').strip() or None
+    ya = UsuarioSubcomision.query.filter_by(user_id=user_id, subcomision_id=sid, activo=True).first()
+    if ya:
+        flash('Ese usuario ya está asignado.')
+    else:
+        db.session.add(UsuarioSubcomision(user_id=user_id, subcomision_id=sid, rol_local=rol_local))
+        db.session.commit()
+        flash('Miembro agregado.')
+    return redirect(url_for('subcomision_miembros', sid=sid))
+
+
+@app.post('/subcomisiones/<int:sid>/miembros/remove')
+@login_required
+@role_required('admin')
+def subcomision_remove_miembro(sid):
+    a = UsuarioSubcomision.query.get_or_404(int(request.form['asid']))
+    if a.subcomision_id != sid: 
+        flash('Operación inválida')
+    else:
+        a.activo = False
+        db.session.commit()
+        flash('Miembro quitado.')
+    return redirect(url_for('subcomision_miembros', sid=sid))
+
+
+@app.post('/subcomisiones/<int:sid>/miembros/setrol')
+@login_required
+@role_required('admin')
+def subcomision_set_rol(sid):
+    a = UsuarioSubcomision.query.get_or_404(int(request.form['asid']))
+    if a.subcomision_id != sid:
+        flash('Operación inválida')
+    else:
+        a.rol_local = (request.form.get('rol_local') or '').strip() or None
+        db.session.commit()
+        flash('Rol actualizado.')
+    return redirect(url_for('subcomision_miembros', sid=sid))
 
 # --------------------
 # Categorías (admin) — por tipo y subcomisión
