@@ -1300,7 +1300,6 @@ def eventos():
             lugar=(request.form.get('lugar') or '').strip() or None,
             descripcion=(request.form.get('descripcion') or '').strip() or None
         )
-        # Campos opcionales
         try:
             v = request.form.get('subcomision_id') or None
             e.subcomision_id = int(v) if v else None
@@ -1309,13 +1308,12 @@ def eventos():
             e.notas = (request.form.get('notas') or '').strip() or None
         except Exception:
             pass
-
         db.session.add(e)
         db.session.commit()
         flash('Evento creado')
         return redirect(url_for('eventos'))
 
-    # Lista para template (sin hasattr en Jinja)
+    # Lista para template
     evs_model = Evento.query.order_by(Evento.fecha.desc()).all()
     evs = [{
         'id': e.id,
@@ -1336,12 +1334,87 @@ def eventos():
     except Exception:
         plant_email, plant_whatsapp = [], []
 
-    body = render("""
+    body = render(dedent("""
     <div class="d-flex justify-content-between align-items-center mb-3">
       <h3 class="text-oliva">Eventos</h3>
     </div>
-    <!-- (resto del HTML tal como lo tenías) -->
-    """, evs=evs, socios=socios, subs=subs, subs_map=subs_map,
+
+    <!-- Nuevo evento -->
+    <form method="post" class="card mb-4">
+      <div class="card-header">Nuevo evento</div>
+      <div class="card-body row g-2">
+        <div class="col-md-4"><input class="form-control" name="titulo" placeholder="Título" required></div>
+        <div class="col-md-2"><input class="form-control" type="date" name="fecha" required></div>
+        <div class="col-md-3"><input class="form-control" name="lugar" placeholder="Lugar (opcional)"></div>
+        <div class="col-md-3"><input class="form-control" name="descripcion" placeholder="Descripción (opcional)"></div>
+        <div class="col-md-3">
+          <select class="form-select" name="subcomision_id">
+            <option value="">Sin subcomisión</option>
+            {% for s in subs %}<option value="{{ s.id }}">{{ s.nombre }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="col-md-3"><input class="form-control" name="presupuesto_ing" type="number" step="0.01" min="0" placeholder="Presup. Ingresos"></div>
+        <div class="col-md-3"><input class="form-control" name="presupuesto_egr" type="number" step="0.01" min="0" placeholder="Presup. Egresos"></div>
+        <div class="col-md-3"><input class="form-control" name="notas" placeholder="Notas (opcional)"></div>
+      </div>
+      <div class="card-footer text-end"><button class="btn btn-oliva">Guardar</button></div>
+    </form>
+
+    {% for e in evs %}
+      <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <div>
+            <strong>{{ e.titulo }}</strong> — {{ e.fecha.strftime('%d/%m/%Y') }} @ {{ e.lugar or '—' }}
+            {% if e.subcomision_id %}
+              <span class="ms-2 badge text-bg-light">{{ subs_map.get(e.subcomision_id) }}</span>
+            {% endif %}
+          </div>
+          <div class="btn-group">
+            <a class="btn btn-sm btn-outline-dark" href="{{ url_for('editar_evento', evento_id=e.id) }}">Editar</a>
+            <a class="btn btn-sm btn-outline-danger" href="{{ url_for('eliminar_evento', evento_id=e.id) }}" onclick="return confirm('¿Eliminar evento?')">Eliminar</a>
+          </div>
+        </div>
+
+        <div class="card-body">
+          {% if e.presupuesto_ing is not none or e.presupuesto_egr is not none or e.notas %}
+            <div class="mb-2 small text-muted">
+              Presup.: Ing ${{ '%.2f' % (e.presupuesto_ing or 0) }} — Egr ${{ '%.2f' % (e.presupuesto_egr or 0) }}
+              {% if e.notas %} — {{ e.notas }}{% endif %}
+            </div>
+          {% endif %}
+
+          <h6 class="text-oliva">Inscripciones</h6>
+          <form method="post" action="{{ url_for('inscribir', evento_id=e.id) }}" class="row g-2 mb-3">
+            <div class="col-md-9">
+              <select class="form-select" name="socio_id" required>
+                <option value="">Inscribir socio…</option>
+                {% for s in socios %}<option value="{{ s.id }}">{{ s.nombre }}</option>{% endfor %}
+              </select>
+            </div>
+            <div class="col-md-3"><button class="btn btn-oliva w-100">Inscribir</button></div>
+          </form>
+
+          {% set insc = Inscripcion.query.filter_by(evento_id=e.id).all() %}
+          {% if insc %}
+            <div class="table-responsive"><table class="table table-sm align-middle">
+              <thead><tr><th>Socio</th><th>Fecha</th><th></th></tr></thead><tbody>
+              {% for i in insc %}{% set s = Socio.query.get(i.socio_id) %}
+                <tr>
+                  <td>{{ s.nombre if s else ('#' ~ i.socio_id) }}</td>
+                  <td>{{ i.fecha.strftime('%d/%m/%Y') }}</td>
+                  <td class="text-end">
+                    <a class="btn btn-sm btn-outline-danger" href="{{ url_for('eliminar_inscripcion', insc_id=i.id) }}" onclick="return confirm('¿Quitar inscripción?')">Quitar</a>
+                  </td>
+                </tr>
+              {% endfor %}
+              </tbody></table></div>
+          {% else %}
+            <em>Sin inscriptos.</em>
+          {% endif %}
+        </div>
+      </div>
+    {% endfor %}
+    """), evs=evs, socios=socios, subs=subs, subs_map=subs_map,
        Inscripcion=Inscripcion, Socio=Socio)
 
     return page(body, title='Eventos')
