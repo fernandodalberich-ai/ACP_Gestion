@@ -178,7 +178,6 @@ class PlantillaCom(db.Model):
     asunto = db.Column(db.String(160))
     cuerpo_html = db.Column(db.Text, nullable=False)     # usamos HTML también para WA (se limpiará)
     variables_json = db.Column(db.Text, default='[]')    # ayuda para UI (lista de variables disponibles)
-cuerpo_c
 
 class UsuarioSubcomision(db.Model):
     __tablename__ = "usuario_subcomision"
@@ -629,34 +628,36 @@ def subcomisiones():
             flash('Ya existe'); return redirect(url_for('subcomisiones'))
         db.session.add(Subcomision(nombre=nombre, activo=True)); db.session.commit()
         flash('Subcomisión creada'); return redirect(url_for('subcomisiones'))
+
     subs = Subcomision.query.order_by(Subcomision.activo.desc(), Subcomision.nombre.asc()).all()
 
-     body = render("""
-     <h3 class="text-oliva">Subcomisiones</h3>
-     <form method="post" class="card mb-3">
-       <div class="card-body d-flex gap-2">
-         <input class="form-control" name="nombre" placeholder="Nueva subcomisión">
-         <button class="btn btn-oliva">Agregar</button>
-       </div>
-     </form>
-     <table class="table table-striped"><thead><tr><th>Nombre</th><th>Activa</th><th class="text-end">Acciones</th></tr></thead><tbody>
-     {% for s in subs %}
-       <tr>
-         <td>{{ s.nombre }}</td>
-         <td>{{ 'Sí' if s.activo else 'No' }}</td>
-         <td class="text-end d-flex gap-2 justify-content-end">
-              <a class="btn btn-sm btn-outline-dark" href="{{ url_for('subcomision_miembros', sid=s.id) }}">Miembros</a>
-           {% if s.activo %}
-              <a class="btn btn-sm btn-outline-danger" href="{{ url_for('toggle_sub', sid=s.id) }}">Desactivar</a>
-           {% else %}
-             <a class="btn btn-sm btn-oliva" href="{{ url_for('toggle_sub', sid=s.id) }}">Activar</a>
-           {% endif %}
-         </td>
-       </tr>
-     {% endfor %}</tbody></table>
-     """, subs=subs)
-    
+    body = render("""
+    <h3 class="text-oliva">Subcomisiones</h3>
+    <form method="post" class="card mb-3">
+      <div class="card-body d-flex gap-2">
+        <input class="form-control" name="nombre" placeholder="Nueva subcomisión">
+        <button class="btn btn-oliva">Agregar</button>
+      </div>
+    </form>
+    <table class="table table-striped"><thead><tr><th>Nombre</th><th>Activa</th><th class="text-end">Acciones</th></tr></thead><tbody>
+    {% for s in subs %}
+      <tr>
+        <td>{{ s.nombre }}</td>
+        <td>{{ 'Sí' if s.activo else 'No' }}</td>
+        <td class="text-end d-flex gap-2 justify-content-end">
+          <a class="btn btn-sm btn-outline-dark" href="{{ url_for('subcomision_miembros', sid=s.id) }}">Miembros</a>
+          {% if s.activo %}
+            <a class="btn btn-sm btn-outline-danger" href="{{ url_for('toggle_sub', sid=s.id) }}">Desactivar</a>
+          {% else %}
+            <a class="btn btn-sm btn-oliva" href="{{ url_for('toggle_sub', sid=s.id) }}">Activar</a>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}</tbody></table>
+    """, subs=subs)
+
     return page(body, title='Subcomisiones')
+
 
 @app.get('/subcomisiones/<int:sid>/toggle')
 @login_required
